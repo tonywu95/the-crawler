@@ -1,0 +1,13 @@
+# Not a Python package: pins the tools the Rust fetch workers shell out to. `uv sync` puts them in
+# .venv/bin. When YouTube breaks extraction, `uv lock --upgrade-package yt-dlp && uv sync`.
+[project]
+name = "the-crawler-tools"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "yt-dlp[default]>=2026.8.19",  # YouTube extraction; [default] includes yt-dlp-ejs for player JS
+    "deno>=2.9.7",                  # the JS runtime yt-dlp needs to read YouTube's player
+]
+
+[tool.uv]
+package = false
