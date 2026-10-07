@@ -2,7 +2,7 @@
 
 A YouTube crawler for Creative Commons video, written in Rust. Its output feeds Astra's data mixes.
 
-Status: scaffold only. The crawler below is designed, but no code has been written yet.
+Status: all four commands are written and unit-tested against a fake API and a fake downloader. Not yet run against the live API or YouTube.
 
 ## Design
 
@@ -47,3 +47,27 @@ uv sync                      # yt-dlp + deno into .venv/bin
 cargo build --release
 export YOUTUBE_API_KEY=...   # a Google Cloud project with YouTube Data API v3 enabled
 ```
+
+Settings live in `config/youtube.yaml` (store, frontier path, queries, filters, fetch limits). Any key left out takes the default in `src/config.rs`.
+
+## Running
+
+```bash
+B=target/release/youtube-crawl
+$B discover                         # once a day: spends the quota; resumes where it stopped
+$B discover --ids-file ids.txt      # also check known ids (ids or watch URLs, one per line)
+$B plan                             # accepted videos → batches/<batch>/shard-*.jsonl
+$B fetch                            # one worker, one download at a time
+$B fetch --rank 2 --world 8         # worker 2 of 8, each on its own IP
+$B status
+```
+
+`discover` runs in this order: check unchecked ids, crawl seed channels, crawl channels (checking new ids after each one), search up to `search_quota`, crawl the channels search turned up, then check again. When the quota runs out it stops cleanly. `plan` puts direct hits (search, seed ids, seed channels) ahead of channel-expansion hits.
+
+`fetch` exits non-zero when it stops early: after `bot_check_limit` bot checks or 429s in a row (waiting `bot_check_backoff_s`, doubling, between them, with every slot paused), or after `error_limit` other failures in a row. The shard it was on keeps no manifest, so the next run picks it up again. An unavailable video (private, removed, region-locked, members-only, age-gated) goes into the manifest as `unavailable` and does not count toward the error streak.
+
+`--store` overrides the store on the command line. For S3-compatible stores (R2 included), set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and, for R2, `AWS_ENDPOINT`. They are read from the environment.
+
+## Tests
+
+`cargo test` runs without network access: the API goes through a fake `Transport` and downloads through a fake `Downloader`.
