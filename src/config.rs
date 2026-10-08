@@ -11,8 +11,6 @@ use serde::Deserialize;
 pub struct Config {
     /// Where shards, media and manifests go: a local path, file://, s3:// or gs:// URL.
     pub store: String,
-    /// The SQLite frontier. Only the coordinator (discover, plan) needs it.
-    pub frontier: PathBuf,
     pub discover: Discover,
     pub filters: Filters,
     pub plan: Plan,
@@ -83,13 +81,19 @@ pub struct Fetch {
     pub egress_db: PathBuf,
     /// USD per IP per month, by provider, for the $ per hour column in `status`.
     pub provider_prices: BTreeMap<String, f64>,
+    /// Queue mode: how long a worker holds a video before it returns to the queue. Renewed
+    /// while the worker is still on it, so this only matters when a worker dies.
+    pub video_lease_s: u64,
+    /// Queue mode: tries before a failing video is marked failed for good.
+    pub max_attempts: u32,
+    /// Queue mode: wait before a failed video may be tried again.
+    pub retry_delay_s: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             store: "data/youtube".into(),
-            frontier: "data/frontier.sqlite".into(),
             discover: Discover::default(),
             filters: Filters::default(),
             plan: Plan::default(),
@@ -150,6 +154,9 @@ impl Default for Fetch {
             max_videos_per_ip_per_hour: 0,
             egress_db: "data/egress.sqlite".into(),
             provider_prices: BTreeMap::new(),
+            video_lease_s: 1_800,
+            max_attempts: 3,
+            retry_delay_s: 600,
         }
     }
 }

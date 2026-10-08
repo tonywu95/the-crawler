@@ -36,7 +36,7 @@ pub async fn run<T: Transport>(
     opts: Options<'_>,
 ) -> Result<Report> {
     let day = crate::frontier::quota_day();
-    let (used, _) = frontier.quota(&day)?;
+    let (used, _) = frontier.quota(&day).await?;
     let mut d = Discover {
         cfg,
         f: frontier,
@@ -62,13 +62,13 @@ struct Discover<'a, T> {
 
 impl<T: Transport> Discover<'_, T> {
     async fn steps(&mut self, opts: Options<'_>) -> Result<()> {
-        self.report.added += self.f.add_ids(&self.cfg.discover.videos, "seed")?;
+        self.report.added += self.f.add_ids(&self.cfg.discover.videos, "seed").await?;
         if let Some(path) = opts.ids_file {
-            self.report.added += self.f.add_ids(&read_ids(path)?, "ids-file")?;
+            self.report.added += self.f.add_ids(&read_ids(path)?, "ids-file").await?;
         }
         self.verify().await?;
         for c in &self.cfg.discover.channels {
-            self.f.add_channel(c, "seed")?;
+            self.f.add_channel(c, "seed").await?;
         }
         self.channels().await?;
         if opts.search {
@@ -79,26 +79,27 @@ impl<T: Transport> Discover<'_, T> {
     }
 
     /// Records what the last call spent, whether or not it succeeded.
-    fn charge(&mut self, search: bool) -> Result<()> {
+    async fn charge(&mut self, search: bool) -> Result<()> {
         let spent = self.api.take_spent();
         self.report.quota_used += spent;
         self.f
             .add_quota(&self.day, spent, if search { spent } else { 0 })
+            .await
     }
 
     /// Checks every `new` id with videos.list, 50 per unit.
     async fn verify(&mut self) -> Result<()> {
         loop {
-            let ids = self.f.unchecked(50)?;
+            let ids = self.f.unchecked(50).await?;
             if ids.is_empty() {
                 return Ok(());
             }
             let r = self.api.videos(&ids).await;
-            self.charge(false)?;
+            self.charge(false).await?;
             let videos = r?;
             for v in &videos {
                 let rejection = v.rejection(&self.cfg.filters);
-                self.f.set_checked(v, rejection.as_deref())?;
+                self.f.set_checked(v, rejection.as_deref()).await?;
                 if rejection.is_some() {
                     self.report.rejected += 1;
                     continue;
@@ -106,14 +107,15 @@ impl<T: Transport> Discover<'_, T> {
                 self.report.accepted += 1;
                 let direct = self
                     .f
-                    .source(&v.id)?
+                    .source(&v.id)
+                    .await?
                     .is_some_and(|s| !s.starts_with("expand:"));
                 if self.cfg.discover.expand_channels && direct && !v.channel_id.is_empty() {
-                    self.f.add_channel(&v.channel_id, "expand")?;
+                    self.f.add_channel(&v.channel_id, "expand").await?;
                 }
             }
             for id in ids.iter().filter(|id| !videos.iter().any(|v| &v.id == *id)) {
-                self.f.set_gone(id)?;
+                self.f.set_gone(id).await?;
                 self.report.gone += 1;
             }
         }
@@ -123,7 +125,7 @@ impl<T: Transport> Discover<'_, T> {
     async fn channels(&mut self) -> Result<()> {
         loop {
             self.verify().await?;
-            let Some(ch) = self.f.next_channel()? else {
+            let Some(ch) = self.f.next_channel().await? else {
                 return Ok(());
             };
             self.channel(ch).await?;
@@ -136,13 +138,13 @@ impl<T: Transport> Discover<'_, T> {
             Some(u) => (ch.channel.clone(), u),
             None => {
                 let r = self.api.channel(&ch.channel).await;
-                self.charge(false)?;
+                self.charge(false).await?;
                 match r? {
                     Some((id, uploads)) => {
-                        self.f.set_uploads(&ch.channel, &id, &uploads)?;
+                        self.f.set_uploads(&ch.channel, &id, &uploads).await?;
                         (id, uploads)
                     }
-                    None => return self.f.channel_done(&ch.channel, Some("not found")),
+                    None => return self.f.channel_done(&ch.channel, Some("not found")).await,
                 }
             }
         };
@@ -159,18 +161,20 @@ impl<T: Transport> Discover<'_, T> {
             if found >= self.cfg.discover.max_uploads_per_channel {
                 return self
                     .f
-                    .channel_done(&ch.channel, Some("max_uploads_per_channel"));
+                    .channel_done(&ch.channel, Some("max_uploads_per_channel"))
+                    .await;
             }
             let r = self.api.playlist(&uploads, next.as_deref()).await;
-            self.charge(false)?;
+            self.charge(false).await?;
             let page = r?;
-            self.report.added += self.f.add_ids(&page.ids, &source)?;
+            self.report.added += self.f.add_ids(&page.ids, &source).await?;
             found += page.ids.len() as u32;
             self.f
-                .channel_page(&ch.channel, page.next.as_deref(), page.ids.len() as u32)?;
+                .channel_page(&ch.channel, page.next.as_deref(), page.ids.len() as u32)
+                .await?;
             next = page.next;
             if next.is_none() {
-                return self.f.channel_done(&ch.channel, None);
+                return self.f.channel_done(&ch.channel, None).await;
             }
         }
     }
@@ -178,25 +182,30 @@ impl<T: Transport> Discover<'_, T> {
     /// Runs the configured queries, pages_per_query pages each, while search_quota lasts.
     async fn search(&mut self) -> Result<()> {
         let per_query = self.cfg.discover.pages_per_query;
-        for s in self.f.pending_searches(&self.cfg.discover.queries)? {
+        for s in self.f.pending_searches(&self.cfg.discover.queries).await? {
             let (mut pages, mut next) = (s.pages, s.next);
             while pages < per_query {
-                let (_, search_used) = self.f.quota(&self.day)?;
+                let (_, search_used) = self.f.quota(&self.day).await?;
                 if search_used + SEARCH_COST > self.cfg.discover.search_quota {
                     return Ok(());
                 }
                 let r = self.api.search(&s.query, next.as_deref()).await;
-                self.charge(true)?;
+                self.charge(true).await?;
                 let page = r?;
-                self.report.added += self.f.add_ids(&page.ids, &format!("search:{}", s.query))?;
+                self.report.added += self
+                    .f
+                    .add_ids(&page.ids, &format!("search:{}", s.query))
+                    .await?;
                 self.report.search_pages += 1;
                 pages += 1;
                 next = page.next;
-                self.f.search_page(
-                    &s.query,
-                    next.as_deref(),
-                    next.is_none() || pages >= per_query,
-                )?;
+                self.f
+                    .search_page(
+                        &s.query,
+                        next.as_deref(),
+                        next.is_none() || pages >= per_query,
+                    )
+                    .await?;
                 if next.is_none() {
                     break;
                 }
@@ -299,19 +308,22 @@ mod tests {
                 ("e2", ("creativeCommon", "UC1")),
             ])),
         );
-        let f = Frontier::memory().unwrap();
+        let Some(f) = crate::frontier::tests::frontier().await else {
+            return;
+        };
         let r = run(&config(), &f, fake, opts()).await.unwrap();
         assert!(!r.out_of_quota);
         assert_eq!(r.search_pages, 2);
         assert_eq!((r.accepted, r.rejected, r.gone), (3, 1, 1)); // s3 is gone
         assert_eq!(r.channels, 1); // UC1 only: s2 was rejected
         // 2 searches + 1 channels + 2 playlist pages + videos.list calls
-        let (used, search) = f.quota(&crate::frontier::quota_day()).unwrap();
+        let (used, search) = f.quota(&crate::frontier::quota_day()).await.unwrap();
         assert_eq!(search, 200);
         assert_eq!(used, r.quota_used);
-        assert_eq!(f.source("e1").unwrap().as_deref(), Some("expand:UC1"));
+        assert_eq!(f.source("e1").await.unwrap().as_deref(), Some("expand:UC1"));
         let planned: Vec<_> = f
             .unplanned(None)
+            .await
             .unwrap()
             .into_iter()
             .map(|(v, _)| v.id)
@@ -337,7 +349,9 @@ mod tests {
         let mut c = config();
         c.discover.pages_per_query = 50;
         c.discover.search_quota = 300;
-        let f = Frontier::memory().unwrap();
+        let Some(f) = crate::frontier::tests::frontier().await else {
+            return;
+        };
         let r = run(&c, &f, fake, opts()).await.unwrap();
         assert_eq!(r.search_pages, 3);
         assert!(!r.out_of_quota);
@@ -352,12 +366,14 @@ mod tests {
             json!({"items": [{"id": {"videoId": "s1"}}], "nextPageToken": "p2"}),
         );
         fake.queue("search", 403, quota_exceeded());
-        let f = Frontier::memory().unwrap();
+        let Some(f) = crate::frontier::tests::frontier().await else {
+            return;
+        };
         let mut c = config();
         c.discover.expand_channels = false;
         let r = run(&c, &f, fake, opts()).await.unwrap();
         assert!(r.out_of_quota);
-        assert_eq!(f.unchecked(10).unwrap(), vec!["s1"]);
+        assert_eq!(f.unchecked(10).await.unwrap(), vec!["s1"]);
 
         // The next run (next day, say) checks s1 first, then continues the query from p2.
         let mut fake = Fake::default();
@@ -371,13 +387,21 @@ mod tests {
         });
         let r = run(&c, &f, fake, opts()).await.unwrap();
         assert_eq!(r.accepted, 1);
-        assert!(f.pending_searches(&c.discover.queries).unwrap().is_empty());
+        assert!(
+            f.pending_searches(&c.discover.queries)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn respects_quota_already_spent_today() {
-        let f = Frontier::memory().unwrap();
+        let Some(f) = crate::frontier::tests::frontier().await else {
+            return;
+        };
         f.add_quota(&crate::frontier::quota_day(), 9_950, 0)
+            .await
             .unwrap();
         let mut fake = Fake::default();
         fake.handle("search", |_| panic!("no quota left for search"));
@@ -405,7 +429,9 @@ mod tests {
         let mut c = config();
         c.discover.channels = vec!["@nine".into()];
         c.discover.max_uploads_per_channel = 120;
-        let f = Frontier::memory().unwrap();
+        let Some(f) = crate::frontier::tests::frontier().await else {
+            return;
+        };
         let r = run(
             &c,
             &f,
@@ -419,7 +445,7 @@ mod tests {
         .unwrap();
         assert_eq!(r.added, 150); // three pages of 50 reach 120
         assert_eq!(r.gone, 150);
-        assert!(f.next_channel().unwrap().is_none());
+        assert!(f.next_channel().await.unwrap().is_none());
     }
 
     #[test]

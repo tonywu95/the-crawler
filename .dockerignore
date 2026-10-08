@@ -1,0 +1,5 @@
+target
+.venv
+data
+config/proxies*.txt
+.git

@@ -9,6 +9,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write;
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
@@ -264,70 +265,76 @@ impl Health {
                 bytes: r.get(5)?,
                 seconds: r.get(6)?,
                 duration_s: r.get(7)?,
-                first: r.get(8)?,
-                last: r.get(9)?,
+                span_s: (r.get::<_, i64>(9)? - r.get::<_, i64>(8)?) as f64,
                 retired: r.get(10)?,
             })
         })?;
-        let mut out = String::new();
-        writeln!(
-            out,
-            "  {:<14} {:>4} {:>7} {:>7} {:>8} {:>7} {:>7} {:>9} {:>8} {:>8}",
-            "provider",
-            "ips",
-            "retired",
-            "tries",
-            "fetched",
-            "strike%",
-            "MB/s",
-            "/IP/day",
-            "hours",
-            "$/hour"
-        )?;
-        for row in rows {
-            let r = row?;
-            let days = ((r.last - r.first) as f64 / 86_400.0).max(1.0 / 24.0);
-            let hours = r.duration_s as f64 / 3600.0;
-            let cost = prices
-                .get(&r.provider)
-                .filter(|_| hours > 0.0)
-                .map(|p| format!("{:.3}", r.ips as f64 * p / 30.0 * days / hours))
-                .unwrap_or_else(|| "-".into());
-            writeln!(
-                out,
-                "  {:<14} {:>4} {:>7} {:>7} {:>8} {:>6.1}% {:>7.1} {:>9.0} {:>8.1} {:>8}",
-                r.provider,
-                r.ips,
-                r.retired,
-                r.attempts,
-                r.fetched,
-                100.0 * r.strikes as f64 / r.attempts.max(1) as f64,
-                if r.seconds > 0.0 {
-                    r.bytes as f64 / 1e6 / r.seconds
-                } else {
-                    0.0
-                },
-                r.fetched as f64 / r.ips.max(1) as f64 / days,
-                hours,
-                cost
-            )?;
-        }
-        Ok(out)
+        format_report(rows.collect::<rusqlite::Result<Vec<_>>>()?, prices)
     }
 }
 
-struct ProviderRow {
-    provider: String,
-    ips: i64,
-    attempts: i64,
-    fetched: i64,
-    strikes: i64,
-    bytes: i64,
-    seconds: f64,
-    duration_s: i64,
-    first: i64,
-    last: i64,
-    retired: i64,
+/// One provider's totals from the attempt log.
+pub struct ProviderRow {
+    pub provider: String,
+    pub ips: i64,
+    pub retired: i64,
+    pub attempts: i64,
+    pub fetched: i64,
+    pub strikes: i64,
+    pub bytes: i64,
+    /// Seconds in yt-dlp across fetched attempts.
+    pub seconds: f64,
+    pub duration_s: i64,
+    /// From the first attempt to the last.
+    pub span_s: f64,
+}
+
+/// The vendor comparison the proxy trial is for. `prices` is USD per IP per month, by
+/// provider, for the $ per hour column.
+pub fn format_report(rows: Vec<ProviderRow>, prices: &BTreeMap<String, f64>) -> Result<String> {
+    let mut out = String::new();
+    writeln!(
+        out,
+        "  {:<14} {:>4} {:>7} {:>7} {:>8} {:>7} {:>7} {:>9} {:>8} {:>8}",
+        "provider",
+        "ips",
+        "retired",
+        "tries",
+        "fetched",
+        "strike%",
+        "MB/s",
+        "/IP/day",
+        "hours",
+        "$/hour"
+    )?;
+    for r in rows {
+        let days = (r.span_s / 86_400.0).max(1.0 / 24.0);
+        let hours = r.duration_s as f64 / 3600.0;
+        let cost = prices
+            .get(&r.provider)
+            .filter(|_| hours > 0.0)
+            .map(|p| format!("{:.3}", r.ips as f64 * p / 30.0 * days / hours))
+            .unwrap_or_else(|| "-".into());
+        writeln!(
+            out,
+            "  {:<14} {:>4} {:>7} {:>7} {:>8} {:>6.1}% {:>7.1} {:>9.0} {:>8.1} {:>8}",
+            r.provider,
+            r.ips,
+            r.retired,
+            r.attempts,
+            r.fetched,
+            100.0 * r.strikes as f64 / r.attempts.max(1) as f64,
+            if r.seconds > 0.0 {
+                r.bytes as f64 / 1e6 / r.seconds
+            } else {
+                0.0
+            },
+            r.fetched as f64 / r.ips.max(1) as f64 / days,
+            hours,
+            cost
+        )?;
+    }
+    Ok(out)
 }
 
 /// One IP's state in the pool.
@@ -388,11 +395,82 @@ fn pick(ips: &mut [Ip], now: Instant, cap: u32) -> Pick {
     }
 }
 
-/// A leased IP. Give it back with `Pool::release`.
+/// A leased IP. Give it back with `IpPool::release`.
 pub struct Lease {
     index: usize,
     started: Instant,
     pub egress: Egress,
+}
+
+/// A source of egress IPs: this worker's own (`Pool`) or one shared by many workers through
+/// Postgres (`SharedPool`).
+pub trait IpPool {
+    /// Waits for a free, rested IP. None when the pool is closed or every IP is retired.
+    fn lease(&self) -> impl Future<Output = Result<Option<Lease>>>;
+    /// Returns an IP: it rests after any outcome, and a strike benches or retires it. Returns
+    /// a note for the log when it was benched or retired.
+    fn release(
+        &self,
+        lease: Lease,
+        video: &str,
+        how: Use,
+    ) -> impl Future<Output = Result<Option<String>>>;
+    /// Makes every waiting `lease` return None.
+    fn close(&self);
+    fn len(&self) -> usize;
+    fn retired(&self) -> impl Future<Output = Result<usize>>;
+}
+
+/// How an IP is paced and punished, the same for both pools.
+#[derive(Clone)]
+struct Rules {
+    pause: (f64, f64),
+    backoff: Duration,
+    backoff_max: Duration,
+    limit: u32,
+    cap: u32,
+}
+
+impl Rules {
+    fn new(cfg: &Fetch) -> Self {
+        Self {
+            pause: (cfg.pause_min_s, cfg.pause_max_s.max(cfg.pause_min_s)),
+            backoff: Duration::from_secs(cfg.bot_check_backoff_s),
+            backoff_max: Duration::from_secs(
+                cfg.bot_check_backoff_max_s.max(cfg.bot_check_backoff_s),
+            ),
+            limit: cfg.bot_check_limit.max(1),
+            cap: cfg.max_videos_per_ip_per_hour,
+        }
+    }
+
+    /// After an attempt by an IP with `strikes` so far: (strikes, rest, retired, note).
+    fn after(&self, label: &str, strikes: u32, how: Use) -> (u32, Duration, bool, Option<String>) {
+        if !how.strike() {
+            let (lo, hi) = self.pause;
+            return (
+                0,
+                Duration::from_secs_f64(rand::random_range(lo..=hi)),
+                false,
+                None,
+            );
+        }
+        let strikes = strikes + 1;
+        if strikes >= self.limit {
+            let note = format!("{label} retired after {strikes} strikes in a row");
+            return (strikes, Duration::ZERO, true, Some(note));
+        }
+        let wait = self
+            .backoff
+            .saturating_mul(1 << (strikes - 1).min(16))
+            .min(self.backoff_max);
+        (
+            strikes,
+            wait,
+            false,
+            Some(format!("{label} benched for {wait:?}")),
+        )
+    }
 }
 
 pub struct Pool {
@@ -401,11 +479,7 @@ pub struct Pool {
     closed: Cell<bool>,
     health: Health,
     worker: String,
-    pause: (f64, f64),
-    backoff: Duration,
-    backoff_max: Duration,
-    limit: u32,
-    cap: u32,
+    rules: Rules,
 }
 
 impl Pool {
@@ -432,51 +506,45 @@ impl Pool {
             closed: Cell::new(false),
             health,
             worker,
-            pause: (cfg.pause_min_s, cfg.pause_max_s.max(cfg.pause_min_s)),
-            backoff: Duration::from_secs(cfg.bot_check_backoff_s),
-            backoff_max: Duration::from_secs(
-                cfg.bot_check_backoff_max_s.max(cfg.bot_check_backoff_s),
-            ),
-            limit: cfg.bot_check_limit.max(1),
-            cap: cfg.max_videos_per_ip_per_hour,
+            rules: Rules::new(cfg),
         })
     }
+}
 
-    pub fn len(&self) -> usize {
+impl IpPool for Pool {
+    fn len(&self) -> usize {
         self.ips.borrow().len()
     }
 
-    pub fn retired(&self) -> usize {
-        self.ips.borrow().iter().filter(|ip| ip.retired).count()
+    async fn retired(&self) -> Result<usize> {
+        Ok(self.ips.borrow().iter().filter(|ip| ip.retired).count())
     }
 
-    /// Wakes every waiting `lease` and makes it return None.
-    pub fn close(&self) {
+    fn close(&self) {
         self.closed.set(true);
         self.released.notify_waiters();
     }
 
-    /// Waits for a free, rested IP. None when the pool is closed or every IP is retired.
-    pub async fn lease(&self) -> Option<Lease> {
+    async fn lease(&self) -> Result<Option<Lease>> {
         loop {
             if self.closed.get() {
-                return None;
+                return Ok(None);
             }
             let now = Instant::now();
-            let picked = pick(&mut self.ips.borrow_mut(), now, self.cap);
+            let picked = pick(&mut self.ips.borrow_mut(), now, self.rules.cap);
             let wait = match picked {
-                Pick::AllRetired => return None,
+                Pick::AllRetired => return Ok(None),
                 Pick::Take(i) => {
                     let mut ips = self.ips.borrow_mut();
                     let ip = &mut ips[i];
                     ip.busy = true;
                     ip.last_used = Some(now);
                     ip.starts.push_back(now);
-                    return Some(Lease {
+                    return Ok(Some(Lease {
                         index: i,
                         started: now,
                         egress: ip.egress.clone(),
-                    });
+                    }));
                 }
                 Pick::Wait(w) => w,
             };
@@ -492,46 +560,251 @@ impl Pool {
         }
     }
 
-    /// Returns an IP: it rests after any outcome, and a strike benches or retires it. Returns a
-    /// note for the log when it was benched or retired.
-    pub fn release(&self, lease: Lease, video: &str, how: Use) -> Result<Option<String>> {
+    async fn release(&self, lease: Lease, video: &str, how: Use) -> Result<Option<String>> {
         let now = Instant::now();
         let seconds = now.duration_since(lease.started).as_secs_f64();
-        let note;
-        let (strikes, benched_until, retired) = {
+        let (strikes, rest, retired, note) = {
             let mut ips = self.ips.borrow_mut();
             let ip = &mut ips[lease.index];
             ip.busy = false;
-            if how.strike() {
-                ip.strikes += 1;
-                if ip.strikes >= self.limit {
-                    ip.retired = true;
-                    note = Some(format!(
-                        "{} retired after {} strikes in a row",
-                        ip.egress.label, ip.strikes
-                    ));
-                } else {
-                    let wait = self
-                        .backoff
-                        .saturating_mul(1 << (ip.strikes - 1).min(16))
-                        .min(self.backoff_max);
-                    ip.rest_until = now + wait;
-                    note = Some(format!("{} benched for {wait:?}", ip.egress.label));
-                }
-            } else {
-                ip.strikes = 0;
-                let (lo, hi) = self.pause;
-                ip.rest_until = now + Duration::from_secs_f64(rand::random_range(lo..=hi));
-                note = None;
-            }
-            let until = unix_now() + ip.rest_until.saturating_duration_since(now).as_secs() as i64;
-            (ip.strikes, until, ip.retired)
+            let (strikes, rest, retired, note) =
+                self.rules.after(&ip.egress.label, ip.strikes, how);
+            ip.strikes = strikes;
+            ip.retired = retired;
+            ip.rest_until = now + rest;
+            (strikes, rest, retired, note)
         };
-        self.health
-            .save(&lease.egress, strikes, benched_until, retired)?;
+        self.health.save(
+            &lease.egress,
+            strikes,
+            unix_now() + rest.as_secs() as i64,
+            retired,
+        )?;
         self.health
             .record(&self.worker, &lease.egress, video, how, seconds)?;
         self.released.notify_waiters();
+        Ok(note)
+    }
+}
+
+/// An IP pool shared by every worker through Postgres. Workers list the same proxies in their
+/// own files (the URLs, with credentials, never reach the database); Postgres holds each IP's
+/// lease, rest, strikes and retirement by label, and the attempt log.
+pub struct SharedPool {
+    db: deadpool_postgres::Pool,
+    list: Vec<Egress>,
+    labels: Vec<String>,
+    owner: String,
+    closed: Cell<bool>,
+    rules: Rules,
+    /// How long an IP lease lasts if its worker dies holding it.
+    hold: Duration,
+}
+
+impl SharedPool {
+    /// Registers the listed IPs (keeping any state they already have).
+    pub async fn new(
+        db: deadpool_postgres::Pool,
+        list: Vec<Egress>,
+        cfg: &Fetch,
+        owner: String,
+    ) -> Result<Self> {
+        let labels: Vec<String> = list.iter().map(|e| e.label.clone()).collect();
+        let providers: Vec<String> = list.iter().map(|e| e.provider.clone()).collect();
+        db.get()
+            .await?
+            .execute(
+                "INSERT INTO ips (label, provider) SELECT * FROM unnest($1::text[], $2::text[])
+                 ON CONFLICT (label) DO NOTHING",
+                &[&labels, &providers],
+            )
+            .await?;
+        Ok(Self {
+            db,
+            list,
+            labels,
+            owner,
+            closed: Cell::new(false),
+            rules: Rules::new(cfg),
+            hold: Duration::from_secs(3600),
+        })
+    }
+
+    /// Forgets the strikes, benches and retirements of the listed IPs.
+    pub async fn reset(&self) -> Result<()> {
+        self.db
+            .get()
+            .await?
+            .execute(
+                "UPDATE ips SET strikes = 0, rest_until = now(), retired = false WHERE label = ANY($1)",
+                &[&self.labels],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The vendor comparison from the shared attempt log.
+    pub async fn report(
+        db: &deadpool_postgres::Pool,
+        prices: &BTreeMap<String, f64>,
+    ) -> Result<String> {
+        let rows = db
+            .get()
+            .await?
+            .query(
+                "SELECT provider, ips, retired, tries, fetched, strikes, bytes, fetch_seconds,
+                        duration_s, span_s::float8
+                 FROM egress_by_provider ORDER BY provider",
+                &[],
+            )
+            .await?;
+        let rows = rows
+            .iter()
+            .map(|r| ProviderRow {
+                provider: r.get(0),
+                ips: r.get(1),
+                retired: r.get(2),
+                attempts: r.get(3),
+                fetched: r.get(4),
+                strikes: r.get(5),
+                bytes: r.get(6),
+                seconds: r.get(7),
+                duration_s: r.get(8),
+                span_s: r.get::<_, Option<f64>>(9).unwrap_or(0.0),
+            })
+            .collect();
+        format_report(rows, prices)
+    }
+}
+
+impl IpPool for SharedPool {
+    fn len(&self) -> usize {
+        self.list.len()
+    }
+
+    async fn retired(&self) -> Result<usize> {
+        let row = self
+            .db
+            .get()
+            .await?
+            .query_one(
+                "SELECT COUNT(*) FROM ips WHERE label = ANY($1) AND retired",
+                &[&self.labels],
+            )
+            .await?;
+        Ok(row.get::<_, i64>(0) as usize)
+    }
+
+    fn close(&self) {
+        self.closed.set(true);
+    }
+
+    async fn lease(&self) -> Result<Option<Lease>> {
+        loop {
+            if self.closed.get() {
+                return Ok(None);
+            }
+            let c = self.db.get().await?;
+            let row = c
+                .query_opt(
+                    "UPDATE ips SET lease_owner = $1, last_used = now(),
+                                    lease_until = now() + make_interval(secs => $4)
+                     WHERE label = (
+                         SELECT label FROM ips
+                         WHERE label = ANY($2) AND NOT retired AND rest_until <= now()
+                           AND (lease_until IS NULL OR lease_until < now())
+                           AND ($3::bigint = 0 OR (SELECT COUNT(*) FROM attempts a
+                                           WHERE a.label = ips.label
+                                             AND a.ts > now() - interval '1 hour') < $3::bigint)
+                         ORDER BY last_used NULLS FIRST, label
+                         LIMIT 1 FOR UPDATE SKIP LOCKED)
+                     RETURNING label",
+                    &[
+                        &self.owner,
+                        &self.labels,
+                        &(self.rules.cap as i64),
+                        &self.hold.as_secs_f64(),
+                    ],
+                )
+                .await?;
+            if let Some(row) = row {
+                let label: String = row.get(0);
+                let index = self
+                    .labels
+                    .iter()
+                    .position(|l| *l == label)
+                    .expect("listed");
+                return Ok(Some(Lease {
+                    index,
+                    started: Instant::now(),
+                    egress: self.list[index].clone(),
+                }));
+            }
+            // Nothing free: wait for the soonest rested IP, polling at least every 5 s since
+            // other workers release IPs too.
+            let row = c
+                .query_one(
+                    "SELECT COUNT(*) FILTER (WHERE NOT retired),
+                            EXTRACT(EPOCH FROM MIN(rest_until - now())
+                                    FILTER (WHERE NOT retired AND rest_until > now()))::float8
+                     FROM ips WHERE label = ANY($1)",
+                    &[&self.labels],
+                )
+                .await?;
+            drop(c);
+            if row.get::<_, i64>(0) == 0 {
+                return Ok(None);
+            }
+            let soonest = row.get::<_, Option<f64>>(1).unwrap_or(5.0);
+            tokio::time::sleep(Duration::from_secs_f64(soonest.clamp(0.2, 5.0))).await;
+        }
+    }
+
+    async fn release(&self, lease: Lease, video: &str, how: Use) -> Result<Option<String>> {
+        let seconds = lease.started.elapsed().as_secs_f64();
+        let mut c = self.db.get().await?;
+        let tx = c.transaction().await?;
+        let strikes: i32 = tx
+            .query_one(
+                "SELECT strikes FROM ips WHERE label = $1 FOR UPDATE",
+                &[&lease.egress.label],
+            )
+            .await?
+            .get(0);
+        let (strikes, rest, retired, note) =
+            self.rules.after(&lease.egress.label, strikes as u32, how);
+        tx.execute(
+            "UPDATE ips SET strikes = $2, rest_until = now() + make_interval(secs => $3),
+                            retired = $4, lease_owner = NULL, lease_until = NULL
+             WHERE label = $1",
+            &[
+                &lease.egress.label,
+                &(strikes as i32),
+                &rest.as_secs_f64(),
+                &retired,
+            ],
+        )
+        .await?;
+        let (bytes, duration_s) = match how {
+            Use::Fetched { bytes, duration_s } => (bytes as i64, duration_s as i64),
+            _ => (0, 0),
+        };
+        tx.execute(
+            "INSERT INTO attempts (worker, label, provider, video, outcome, bytes, seconds, duration_s)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                &self.owner,
+                &lease.egress.label,
+                &lease.egress.provider,
+                &video,
+                &how.name(),
+                &bytes,
+                &seconds,
+                &duration_s,
+            ],
+        )
+        .await?;
+        tx.commit().await?;
         Ok(note)
     }
 }
@@ -629,36 +902,36 @@ mod tests {
             ..cfg()
         };
         let pool = Pool::new(list(2), &c, Health::memory().unwrap(), "w".into()).unwrap();
-        let a = pool.lease().await.unwrap();
-        let note = pool.release(a, "v1", Use::BotCheck).unwrap().unwrap();
+        let a = pool.lease().await.unwrap().unwrap();
+        let note = pool.release(a, "v1", Use::BotCheck).await.unwrap().unwrap();
         assert!(note.contains("benched for 600s"), "{note}");
         // The benched IP is skipped; the other one serves.
-        let b = pool.lease().await.unwrap();
+        let b = pool.lease().await.unwrap().unwrap();
         assert_eq!(b.egress.label, "acme/10.0.0.1:8080");
-        pool.release(
-            b,
-            "v1",
-            Use::Fetched {
-                bytes: 5_000_000,
-                duration_s: 120,
-            },
-        )
-        .unwrap();
+        let fetched = Use::Fetched {
+            bytes: 5_000_000,
+            duration_s: 120,
+        };
+        pool.release(b, "v1", fetched).await.unwrap();
 
         // Strikes reach the limit: retired, and saved. (Skip the 600 s bench.)
         pool.ips.borrow_mut()[0].rest_until = Instant::now();
-        let a = pool.lease().await.unwrap();
+        let a = pool.lease().await.unwrap().unwrap();
         assert_eq!(a.egress.label, "acme/10.0.0.0:8080");
-        let note = pool.release(a, "v2", Use::ProxyError).unwrap().unwrap();
+        let note = pool
+            .release(a, "v2", Use::ProxyError)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(note.contains("retired after 2 strikes"), "{note}");
-        assert_eq!(pool.retired(), 1);
+        assert_eq!(pool.retired().await.unwrap(), 1);
         let (strikes, _, retired) = pool.health.load("acme/10.0.0.0:8080").unwrap().unwrap();
         assert_eq!((strikes, retired), (2, true));
 
         // A new pool on the same health table starts with it retired.
         let Pool { health, .. } = pool;
         let pool = Pool::new(list(2), &c, health, "w".into()).unwrap();
-        assert_eq!(pool.retired(), 1);
+        assert_eq!(pool.retired().await.unwrap(), 1);
         let report = pool
             .health
             .report(&BTreeMap::from([("acme".into(), 1.5)]))
@@ -666,12 +939,8 @@ mod tests {
         assert!(report.contains("acme"), "{report}");
         assert!(report.contains("66.7%"), "{report}"); // 2 strikes in 3 tries
         pool.health.reset().unwrap();
-        assert_eq!(
-            Pool::new(list(2), &c, pool.health, "w".into())
-                .unwrap()
-                .retired(),
-            0
-        );
+        let pool = Pool::new(list(2), &c, pool.health, "w".into()).unwrap();
+        assert_eq!(pool.retired().await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -679,7 +948,77 @@ mod tests {
         let pool = Pool::new(list(1), &cfg(), Health::memory().unwrap(), "w".into()).unwrap();
         let held = pool.lease().await.unwrap();
         let (got, ()) = tokio::join!(pool.lease(), async { pool.close() });
-        assert!(got.is_none());
+        assert!(got.unwrap().is_none());
         drop(held);
+    }
+
+    /// Two workers sharing three IPs through Postgres never hold the same one, and a strike or
+    /// retirement by one is seen by the other.
+    #[tokio::test]
+    async fn shared_pool_coordinates_workers() {
+        let Some(db) = crate::db::test::pool().await else {
+            return;
+        };
+        let c = Fetch {
+            bot_check_limit: 2,
+            bot_check_backoff_s: 600,
+            ..cfg()
+        };
+        let a = SharedPool::new(db.clone(), list(3), &c, "a".into())
+            .await
+            .unwrap();
+        let b = SharedPool::new(db.clone(), list(3), &c, "b".into())
+            .await
+            .unwrap();
+        let x = a.lease().await.unwrap().unwrap();
+        let y = b.lease().await.unwrap().unwrap();
+        let z = a.lease().await.unwrap().unwrap();
+        let mut held = vec![
+            x.egress.label.clone(),
+            y.egress.label.clone(),
+            z.egress.label.clone(),
+        ];
+        held.sort();
+        held.dedup();
+        assert_eq!(held.len(), 3, "an IP was leased twice");
+
+        // y gets a bot check: benched for 600 s, so after x and z come back only they serve.
+        let y_label = y.egress.label.clone();
+        let note = b.release(y, "v1", Use::BotCheck).await.unwrap().unwrap();
+        assert!(note.contains("benched for 600s"), "{note}");
+        a.release(
+            x,
+            "v2",
+            Use::Fetched {
+                bytes: 10,
+                duration_s: 60,
+            },
+        )
+        .await
+        .unwrap();
+        a.release(z, "v3", Use::Unavailable).await.unwrap();
+        for _ in 0..4 {
+            let l = b.lease().await.unwrap().unwrap();
+            assert_ne!(l.egress.label, y_label);
+            b.release(l, "v", Use::Failed).await.unwrap();
+        }
+
+        // A second strike on every IP retires them all; both workers then get None.
+        db.get()
+            .await
+            .unwrap()
+            .execute("UPDATE ips SET rest_until = now(), strikes = 1", &[])
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let l = a.lease().await.unwrap().unwrap();
+            a.release(l, "v", Use::BotCheck).await.unwrap();
+        }
+        assert_eq!(a.retired().await.unwrap(), 3);
+        assert!(b.lease().await.unwrap().is_none());
+        let report = SharedPool::report(&db, &BTreeMap::new()).await.unwrap();
+        assert!(report.contains("acme"), "{report}");
+        b.reset().await.unwrap();
+        assert_eq!(a.retired().await.unwrap(), 0);
     }
 }

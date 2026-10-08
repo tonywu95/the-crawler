@@ -2,7 +2,7 @@
 
 A YouTube crawler for Creative Commons video, written in Rust. Its output feeds Astra's data mixes.
 
-Status: all four commands are written and unit-tested against a fake API and a fake downloader, and fetch can spread downloads over a proxy list (design phase 1). Not yet run against the live API or YouTube.
+Status: all four commands are written and unit-tested against a fake API and a fake downloader. fetch can spread downloads over a proxy list (design phase 1), and many workers can share a Postgres work queue and IP pool (phase 2). Not yet run against the live API or YouTube.
 
 ## Design
 
@@ -52,6 +52,8 @@ Settings live in `config/youtube.yaml` (store, frontier path, queries, filters, 
 
 ## Running
 
+Discover, plan, status and queue-mode fetch keep their state in Postgres at `DATABASE_URL` (an environment variable, since it holds a password). Any Postgres 13+ works; for a laptop, `docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=pw postgres:16`, then `export DATABASE_URL=postgres://postgres:pw@localhost/postgres`. Tables are created on first use.
+
 ```bash
 B=target/release/youtube-crawl
 $B discover                         # once a day: spends the quota; resumes where it stopped
@@ -60,8 +62,14 @@ $B plan                             # accepted videos → batches/<batch>/shard-
 $B fetch                            # one worker, one download at a time
 $B fetch --rank 2 --world 8         # worker 2 of 8, each on its own IP
 $B fetch --proxies config/proxies.txt --jobs 8   # downloads spread over a proxy list
+$B fetch --queue --jobs 8 --proxies config/proxies.txt   # lease work from Postgres (any number of workers)
 $B status
 ```
+
+There are two ways to hand out work:
+
+- **Queue mode (`fetch --queue`)**, for many workers. Each download slot leases one accepted video at a time from Postgres (`FOR UPDATE SKIP LOCKED`), direct hits first. A lease lasts `video_lease_s` and is renewed while the worker is on the video, so a worker that dies only loses its videos for that long. A failed video goes back in the queue after `retry_delay_s` and is marked failed after `max_attempts` tries; fetched and unavailable videos are final. Workers can join or leave at any time, and each exits when the queue is empty. Proxy IPs are shared too: every worker lists the same proxies in its own file, and Postgres holds each IP's lease, rest, strikes and retirement by label, so two workers never use one IP at once and a retirement applies everywhere. The proxy URLs and passwords never reach the database.
+- **Shard mode (`plan`, then `fetch`)**, for a laptop or a fixed set of machines without database access. `plan` writes shards to the store, and worker `rank` of `world` takes every shard k with k % (world × jobs) == its slot. IP health lives in `fetch.egress_db` on each worker.
 
 `discover` runs in this order: check unchecked ids, crawl seed channels, crawl channels (checking new ids after each one), search up to `search_quota`, crawl the channels search turned up, then check again. When the quota runs out it stops cleanly. `plan` puts direct hits (search, seed ids, seed channels) ahead of channel-expansion hits.
 
@@ -71,10 +79,16 @@ $B status
 
 The proxy list has one proxy per line, `<provider> <url>`, for example `acme http://user:pass@gw.acme.net:7000`; `config/proxies*.txt` is git-ignored. Logs, manifests and the health database name a proxy only by its label, `acme/gw.acme.net:7000#1`, never by its URL. The URL is passed to yt-dlp on its command line, so it is visible to other users of the same machine.
 
-Every attempt (IP, provider, outcome, bytes, seconds in yt-dlp) goes into `fetch.egress_db` on the worker. `status` turns that into the proxy trial's comparison: for each provider, IPs, retired, tries, fetched, strike rate, MB/s, videos per IP per day, hours fetched and, given `provider_prices`, $ per hour of video. An unavailable video (private, removed, region-locked, members-only, age-gated) goes into the manifest as `unavailable` and does not count toward the error streak.
+Every attempt (IP, provider, outcome, bytes, seconds in yt-dlp) goes into the `attempts` table in queue mode, or into `fetch.egress_db` on the worker in shard mode. `status` turns that into the proxy trial's comparison: for each provider, IPs, retired, tries, fetched, strike rate, MB/s, videos per IP per day, hours fetched and, given `provider_prices`, $ per hour of video. An unavailable video (private, removed, region-locked, members-only, age-gated) goes into the manifest as `unavailable` and does not count toward the error streak.
+
+`status` also prints the queue (videos queued, leased, fetched, unavailable and failed, with GB and hours). The same numbers are SQL views, `fetch_progress` and `egress_by_provider`, for a dashboard.
 
 `--store` overrides the store on the command line. For S3-compatible stores (R2 included), set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and, for R2, `AWS_ENDPOINT`. They are read from the environment.
 
+## Containers
+
+The `Dockerfile` builds a worker image: the binary, plus yt-dlp and deno pinned by `uv.lock`. It defaults to `fetch --queue --jobs 4` and takes `DATABASE_URL`, store credentials and a mounted proxy list; the header comment has an example `docker run`.
+
 ## Tests
 
-`cargo test` runs without network access: the API goes through a fake `Transport` and downloads through a fake `Downloader`.
+`cargo test` runs without network access: the API goes through a fake `Transport` and downloads through a fake `Downloader`. The frontier, queue and shared-pool tests need a Postgres: set `TEST_DATABASE_URL` (each test makes its own schema there, so use a throwaway database). Without it those tests print a note and pass without checking anything.
