@@ -46,9 +46,24 @@ pub async fn run(
     if shard_size == 0 {
         bail!("plan.shard_size must be positive");
     }
-    let videos = frontier.unplanned(limit)?;
+    let videos = frontier.unplanned(limit).await?;
     if videos.is_empty() {
         return Ok(None);
+    }
+    let batch = write_batch(store, &videos, shard_size).await?;
+    let ids: Vec<String> = videos.into_iter().map(|(v, _)| v.id).collect();
+    frontier.set_batch(&ids, &batch.batch).await?;
+    Ok(Some(batch))
+}
+
+/// Writes `videos` as a new batch in the store: shards first, batch.json last.
+pub async fn write_batch(
+    store: &Store,
+    videos: &[(Video, String)],
+    shard_size: usize,
+) -> Result<Batch> {
+    if shard_size == 0 {
+        bail!("plan.shard_size must be positive");
     }
     let now = Utc::now();
     let name = now.format("%Y%m%d-%H%M%S").to_string();
@@ -84,9 +99,7 @@ pub async fn run(
             serde_json::to_vec_pretty(&batch)?,
         )
         .await?;
-    let ids: Vec<String> = videos.into_iter().map(|(v, _)| v.id).collect();
-    frontier.set_batch(&ids, &name)?;
-    Ok(Some(batch))
+    Ok(batch)
 }
 
 /// Every complete batch in the store, oldest first.
@@ -136,12 +149,14 @@ pub mod tests {
     async fn writes_shards_then_batch() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().to_str().unwrap()).unwrap();
-        let f = Frontier::memory().unwrap();
+        let Some(f) = crate::frontier::tests::frontier().await else {
+            return;
+        };
         let ids: Vec<String> = (0..5).map(|i| format!("v{i}")).collect();
-        f.add_ids(&ids[..2], "expand:UC1").unwrap();
-        f.add_ids(&ids[2..], "search:q").unwrap();
+        f.add_ids(&ids[..2], "expand:UC1").await.unwrap();
+        f.add_ids(&ids[2..], "search:q").await.unwrap();
         for id in &ids {
-            f.set_checked(&video(id), None).unwrap();
+            f.set_checked(&video(id), None).await.unwrap();
         }
         let b = run(&f, &store, 2, Some(4)).await.unwrap().unwrap();
         assert_eq!((b.shards, b.videos), (2, 4));
@@ -154,19 +169,32 @@ pub mod tests {
         assert_eq!(first, vec!["v2", "v3"]); // direct hits first
         let all = batches(&store).await.unwrap();
         assert_eq!(all.len(), 1);
-        assert_eq!(f.unplanned(None).unwrap().len(), 1);
+        assert_eq!(f.unplanned(None).await.unwrap().len(), 1);
         assert!(read_shard(&store, &b.batch, 2).await.is_err());
     }
 
     #[tokio::test]
     async fn nothing_to_plan() {
+        let Some(f) = crate::frontier::tests::frontier().await else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().to_str().unwrap()).unwrap();
-        assert!(
-            run(&Frontier::memory().unwrap(), &store, 10, None)
-                .await
-                .unwrap()
-                .is_none()
+        assert!(run(&f, &store, 10, None).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn write_batch_needs_no_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().to_str().unwrap()).unwrap();
+        let videos: Vec<_> = (0..3)
+            .map(|i| (video(&format!("v{i}")), "seed".to_string()))
+            .collect();
+        let b = write_batch(&store, &videos, 2).await.unwrap();
+        assert_eq!((b.shards, b.videos), (2, 3));
+        assert_eq!(
+            read_shard(&store, &b.batch, 1).await.unwrap()[0].video.id,
+            "v2"
         );
     }
 }

@@ -2,6 +2,7 @@
 
 mod api;
 mod config;
+mod db;
 mod discover;
 mod egress;
 mod fetch;
@@ -62,6 +63,13 @@ enum Command {
         /// Forget every IP's strikes, benches and retirements before starting.
         #[arg(long)]
         reset_egress: bool,
+        /// Lease videos from the Postgres queue (DATABASE_URL) instead of reading shards; IPs
+        /// are then shared with every other queue worker through Postgres.
+        #[arg(long)]
+        queue: bool,
+        /// Queue mode: stop after this many videos.
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Frontier counts, today's quota, and per-batch progress.
     Status,
@@ -79,7 +87,7 @@ async fn main() -> Result<()> {
             ids_file,
             no_search,
         } => {
-            let f = frontier::Frontier::open(&cfg.frontier)?;
+            let f = frontier::Frontier::open(&db::url_from_env()?).await?;
             let opts = discover::Options {
                 ids_file: ids_file.as_deref(),
                 search: !no_search,
@@ -102,7 +110,7 @@ async fn main() -> Result<()> {
             );
         }
         Command::Plan { limit } => {
-            let f = frontier::Frontier::open(&cfg.frontier)?;
+            let f = frontier::Frontier::open(&db::url_from_env()?).await?;
             let store = store::Store::open(&cfg.store)?;
             match plan::run(&f, &store, cfg.plan.shard_size, limit).await? {
                 Some(b) => println!(
@@ -119,6 +127,8 @@ async fn main() -> Result<()> {
             batch,
             proxies,
             reset_egress,
+            queue,
+            limit,
         } => {
             let store = store::Store::open(&cfg.store)?;
             let dl = fetch::YtDlp::new(&cfg.fetch)?;
@@ -126,38 +136,42 @@ async fn main() -> Result<()> {
                 Some(path) => egress::load_list(&path)?,
                 None => vec![egress::Egress::direct()],
             };
-            let health = egress::Health::open(&cfg.fetch.egress_db)?;
-            if reset_egress {
-                health.reset()?;
-            }
-            let pool = egress::Pool::new(list, &cfg.fetch, health, format!("{rank}/{world}"))?;
-            eprintln!(
-                "fetch: {} egress IPs ({} retired)",
-                pool.len(),
-                pool.retired()
-            );
-            if jobs > pool.len() {
-                eprintln!(
-                    "fetch: {jobs} jobs but {} IPs; an IP serves one video at a time",
-                    pool.len()
+            let r = if queue {
+                let f = frontier::Frontier::new(
+                    db::connect(&db::url_from_env()?, None, jobs * 2 + 2).await?,
                 );
-            }
-            let r = fetch::run(
-                &cfg.fetch,
-                &store,
-                &dl,
-                &pool,
-                &fetch::Options {
+                let owner = worker_id();
+                let pool =
+                    egress::SharedPool::new(f.pool().clone(), list, &cfg.fetch, owner.clone())
+                        .await?;
+                if reset_egress {
+                    pool.reset().await?;
+                }
+                announce(&pool, jobs).await?;
+                let opts = fetch::QueueOptions { jobs, owner, limit };
+                fetch::run_queue(&cfg.fetch, &store, &dl, &pool, &f, &opts).await?
+            } else {
+                let health = egress::Health::open(&cfg.fetch.egress_db)?;
+                if reset_egress {
+                    health.reset()?;
+                }
+                let pool = egress::Pool::new(list, &cfg.fetch, health, format!("{rank}/{world}"))?;
+                announce(&pool, jobs).await?;
+                let opts = fetch::Options {
                     rank,
                     world,
                     jobs,
                     batch,
-                },
-            )
-            .await?;
+                };
+                fetch::run(&cfg.fetch, &store, &dl, &pool, &opts).await?
+            };
+            let shards = if queue {
+                String::new()
+            } else {
+                format!("{} shards done; ", r.shards)
+            };
             println!(
-                "fetch: {} shards done; {} fetched, {} already had, {} unavailable, {} failed, {} strikes; {:.2} GB",
-                r.shards,
+                "fetch: {shards}{} fetched, {} already had, {} unavailable, {} failed, {} strikes; {:.2} GB",
                 r.fetched,
                 r.skipped,
                 r.unavailable,
@@ -170,6 +184,32 @@ async fn main() -> Result<()> {
             let store = store::Store::open(&cfg.store)?;
             print!("{}", status::run(&cfg, &store).await?);
         }
+    }
+    Ok(())
+}
+
+/// This process, as recorded on leases and attempts: host and pid.
+fn worker_id() -> String {
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "worker".into());
+    format!("{host}-{}", std::process::id())
+}
+
+async fn announce<P: egress::IpPool>(pool: &P, jobs: usize) -> Result<()> {
+    eprintln!(
+        "fetch: {} egress IPs ({} retired)",
+        pool.len(),
+        pool.retired().await?
+    );
+    if jobs > pool.len() {
+        eprintln!(
+            "fetch: {jobs} jobs but {} IPs; an IP serves one video at a time",
+            pool.len()
+        );
     }
     Ok(())
 }

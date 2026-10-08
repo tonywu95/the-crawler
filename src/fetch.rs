@@ -16,7 +16,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Fetch;
-use crate::egress::{Pool, Use};
+use crate::egress::{IpPool, Use};
+use crate::frontier::Frontier;
 use crate::plan::{self, Entry};
 use crate::store::Store;
 
@@ -233,22 +234,22 @@ pub struct Report {
 }
 
 /// State the slots share. They run on one task, so plain cells suffice.
-struct Shared<'a> {
+struct Shared<'a, P> {
     cfg: &'a Fetch,
     store: &'a Store,
     worker: String,
-    pool: &'a Pool,
+    pool: &'a P,
     stop: RefCell<Option<String>>,
     last_strike: RefCell<String>,
     error_streak: Cell<u32>,
     report: RefCell<Report>,
 }
 
-pub async fn run<D: Downloader>(
+pub async fn run<D: Downloader, P: IpPool>(
     cfg: &Fetch,
     store: &Store,
     downloader: &D,
-    pool: &Pool,
+    pool: &P,
     opts: &Options,
 ) -> Result<Report> {
     if opts.world == 0 || opts.jobs == 0 || opts.rank >= opts.world {
@@ -290,8 +291,115 @@ pub async fn run<D: Downloader>(
     Ok(shared.report.into_inner())
 }
 
-async fn run_slot<D: Downloader>(
-    sh: &Shared<'_>,
+pub struct QueueOptions {
+    pub jobs: usize,
+    /// This process, as recorded on its leases: host and pid.
+    pub owner: String,
+    /// Stop after leasing this many videos.
+    pub limit: Option<usize>,
+}
+
+/// Queue mode: each slot leases one video at a time from Postgres until the queue is empty.
+/// Failures are retried up to `max_attempts`, after `retry_delay_s`, by whichever worker leases
+/// them next. Outcomes go to the frontier rather than to manifests.
+pub async fn run_queue<D: Downloader, P: IpPool>(
+    cfg: &Fetch,
+    store: &Store,
+    downloader: &D,
+    pool: &P,
+    frontier: &Frontier,
+    opts: &QueueOptions,
+) -> Result<Report> {
+    if opts.jobs == 0 {
+        bail!("need jobs >= 1");
+    }
+    let shared = Shared {
+        cfg,
+        store,
+        worker: opts.owner.clone(),
+        pool,
+        stop: RefCell::new(None),
+        last_strike: RefCell::new(String::new()),
+        error_streak: Cell::new(0),
+        report: RefCell::new(Report::default()),
+    };
+    let taken = Cell::new(0);
+    let work = (0..opts.jobs).map(|_| queue_slot(&shared, downloader, frontier, opts, &taken));
+    for r in futures::future::join_all(work).await {
+        r?;
+    }
+    if let Some(why) = shared.stop.borrow().as_ref() {
+        bail!("worker stopped: {why}");
+    }
+    Ok(shared.report.into_inner())
+}
+
+async fn queue_slot<D: Downloader, P: IpPool>(
+    sh: &Shared<'_, P>,
+    dl: &D,
+    frontier: &Frontier,
+    opts: &QueueOptions,
+    taken: &Cell<usize>,
+) -> Result<()> {
+    let hold = std::time::Duration::from_secs(sh.cfg.video_lease_s.max(30));
+    loop {
+        if sh.stop.borrow().is_some() || opts.limit.is_some_and(|l| taken.get() >= l) {
+            return Ok(());
+        }
+        let Some(leased) = frontier.lease(&opts.owner, 1, hold).await?.pop() else {
+            return Ok(()); // the queue is empty
+        };
+        taken.set(taken.get() + 1);
+        let entry = Entry {
+            video: leased.video,
+            source: leased.source,
+        };
+        let id = entry.video.id.clone();
+        let result = tokio::select! {
+            r = fetch_one(sh, dl, &entry, "queue", 0) => r,
+            () = heartbeat(frontier, &id, &opts.owner, hold) => unreachable!(),
+        };
+        let line = match result {
+            Ok(Some(line)) => line,
+            Ok(None) => {
+                // Stopping: hand the video straight back.
+                let why = Some("worker stopped");
+                frontier
+                    .requeue(&id, &opts.owner, why, Default::default())
+                    .await?;
+                return Ok(());
+            }
+            Err(e) => {
+                let _ = frontier
+                    .requeue(&id, &opts.owner, Some("worker error"), Default::default())
+                    .await;
+                return Err(e);
+            }
+        };
+        let reason = line.reason.as_deref();
+        if line.status == "failed" && leased.attempts < sh.cfg.max_attempts as i32 {
+            let delay = std::time::Duration::from_secs(sh.cfg.retry_delay_s);
+            frontier.requeue(&id, &opts.owner, reason, delay).await?;
+        } else {
+            frontier
+                .finish(&id, &line.status, reason, line.bytes)
+                .await?;
+        }
+    }
+}
+
+/// Renews a video lease every third of its length; never returns.
+async fn heartbeat(frontier: &Frontier, id: &str, owner: &str, hold: std::time::Duration) {
+    loop {
+        tokio::time::sleep(hold / 3).await;
+        if let Err(e) = frontier.extend(id, owner, hold).await {
+            eprintln!("fetch: renewing the lease on {id}: {e:#}");
+        }
+    }
+}
+
+async fn run_slot<D: Downloader, P: IpPool>(
+    sh: &Shared<'_, P>,
     dl: &D,
     shards: Vec<(String, usize)>,
 ) -> Result<()> {
@@ -323,8 +431,8 @@ async fn run_slot<D: Downloader>(
 }
 
 /// Fetches one video, retrying through bot-check backoff. None means the worker is stopping.
-async fn fetch_one<D: Downloader>(
-    sh: &Shared<'_>,
+async fn fetch_one<D: Downloader, P: IpPool>(
+    sh: &Shared<'_, P>,
     dl: &D,
     entry: &Entry,
     batch: &str,
@@ -352,8 +460,8 @@ async fn fetch_one<D: Downloader>(
         if sh.stop.borrow().is_some() {
             return Ok(None);
         }
-        let Some(lease) = sh.pool.lease().await else {
-            if sh.pool.retired() == sh.pool.len() {
+        let Some(lease) = sh.pool.lease().await? else {
+            if sh.pool.retired().await? == sh.pool.len() {
                 stop(
                     sh,
                     format!(
@@ -377,7 +485,7 @@ async fn fetch_one<D: Downloader>(
                 ..o
             },
             Err(e) => {
-                sh.pool.release(lease, &v.id, Use::Failed)?;
+                sh.pool.release(lease, &v.id, Use::Failed).await?;
                 return Err(e);
             }
         };
@@ -394,7 +502,7 @@ async fn fetch_one<D: Downloader>(
                     duration_s: v.duration_s,
                 };
                 // The IP is done once the files are local; it rests while we upload.
-                sh.pool.release(lease, &v.id, how)?;
+                sh.pool.release(lease, &v.id, how).await?;
                 sh.error_streak.set(0);
                 let bytes =
                     upload(sh, entry, dir.path(), &media, batch, shard, &record_path).await?;
@@ -424,7 +532,11 @@ async fn fetch_one<D: Downloader>(
                         Failure::BotCheck(r) => (Use::BotCheck, r),
                         _ => unreachable!(),
                     };
-                    let note = sh.pool.release(lease, &v.id, how)?.unwrap_or_default();
+                    let note = sh
+                        .pool
+                        .release(lease, &v.id, how)
+                        .await?
+                        .unwrap_or_default();
                     sh.report.borrow_mut().strikes += 1;
                     eprintln!("fetch: {} via {label}: {reason}; {note}", v.id);
                     *sh.last_strike.borrow_mut() = reason;
@@ -438,7 +550,7 @@ async fn fetch_one<D: Downloader>(
                 Failure::Error(reason) => (Use::Failed, error(sh, line("failed", Some(reason), 0))),
             },
         };
-        sh.pool.release(lease, &v.id, how)?;
+        sh.pool.release(lease, &v.id, how).await?;
         if sh.stop.borrow().is_some() {
             return Ok(None);
         }
@@ -459,7 +571,7 @@ fn local_bytes(dir: &Path, id: &str) -> Result<u64> {
     Ok(total)
 }
 
-fn error(sh: &Shared<'_>, line: ManifestLine) -> ManifestLine {
+fn error<P: IpPool>(sh: &Shared<'_, P>, line: ManifestLine) -> ManifestLine {
     let n = sh.error_streak.get() + 1;
     sh.error_streak.set(n);
     sh.report.borrow_mut().failed += 1;
@@ -480,7 +592,7 @@ fn error(sh: &Shared<'_>, line: ManifestLine) -> ManifestLine {
     line
 }
 
-fn stop(sh: &Shared<'_>, why: String) {
+fn stop<P: IpPool>(sh: &Shared<'_, P>, why: String) {
     eprintln!("fetch: stopping: {why}");
     sh.stop.borrow_mut().get_or_insert(why);
     sh.pool.close();
@@ -507,8 +619,8 @@ fn find_media(dir: &Path, id: &str) -> Result<Option<PathBuf>> {
 }
 
 /// Uploads media, then captions, then the record. Returns the bytes uploaded.
-async fn upload(
-    sh: &Shared<'_>,
+async fn upload<P: IpPool>(
+    sh: &Shared<'_, P>,
     entry: &Entry,
     dir: &Path,
     media: &Path,
@@ -566,8 +678,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::egress::{self, Egress, Health};
-    use crate::frontier::Frontier;
+    use crate::egress::{self, Egress, Health, Pool};
     use crate::plan::tests::video;
 
     /// Plays a script per video id; the last step repeats. Records every call and the proxy it
@@ -677,13 +788,10 @@ mod tests {
     async fn setup(n: usize, size: usize) -> (tempfile::TempDir, Store, String) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().to_str().unwrap()).unwrap();
-        let f = Frontier::memory().unwrap();
-        let ids: Vec<String> = (0..n).map(|i| format!("vid{i:08}")).collect();
-        f.add_ids(&ids, "search:q").unwrap();
-        for id in &ids {
-            f.set_checked(&video(id), None).unwrap();
-        }
-        let b = plan::run(&f, &store, size, None).await.unwrap().unwrap();
+        let videos: Vec<_> = (0..n)
+            .map(|i| (video(&format!("vid{i:08}")), "search:q".to_string()))
+            .collect();
+        let b = plan::write_batch(&store, &videos, size).await.unwrap();
         (dir, store, b.batch)
     }
 
@@ -905,7 +1013,7 @@ mod tests {
         let dl = FakeDl::default();
         let r = run(&c, &store, &dl, &p, &opts(0, 1, 1)).await.unwrap();
         assert_eq!((r.fetched, r.strikes, r.failed), (4, 2, 0));
-        assert_eq!(p.retired(), 1);
+        assert_eq!(p.retired().await.unwrap(), 1);
         // bad, good (v0); bad again (v1) retires it; then good for the rest.
         let used: Vec<_> = dl
             .proxies
@@ -950,6 +1058,122 @@ mod tests {
         let reason = m[0].reason.as_deref().unwrap();
         assert!(reason.contains("acme/gw.acme.net:7000#1"), "{reason}");
         assert!(!reason.contains("s3cret"), "{reason}");
+    }
+
+    /// A frontier with `n` accepted videos, and a scratch store.
+    async fn queue_setup(n: usize) -> Option<(Frontier, tempfile::TempDir, Store)> {
+        let f = crate::frontier::tests::frontier().await?;
+        let ids: Vec<String> = (0..n).map(|i| format!("vid{i:08}")).collect();
+        f.add_ids(&ids, "search:q").await.unwrap();
+        for id in &ids {
+            f.set_checked(&video(id), None).await.unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().to_str().unwrap()).unwrap();
+        Some((f, dir, store))
+    }
+
+    fn queue_opts(owner: &str, jobs: usize) -> QueueOptions {
+        QueueOptions {
+            jobs,
+            owner: owner.into(),
+            limit: None,
+        }
+    }
+
+    /// Two workers on one queue and one shared IP list fetch every video exactly once.
+    #[tokio::test]
+    async fn queue_workers_split_the_work() {
+        let Some((f, _dir, store)) = queue_setup(8).await else {
+            return;
+        };
+        let list = egress::parse_list(
+            "a http://10.0.0.1:1\na http://10.0.0.2:1\nb http://10.0.0.3:1\nb http://10.0.0.4:1\n",
+        )
+        .unwrap();
+        let c = cfg();
+        let pa = egress::SharedPool::new(f.pool().clone(), list.clone(), &c, "a".into())
+            .await
+            .unwrap();
+        let pb = egress::SharedPool::new(f.pool().clone(), list, &c, "b".into())
+            .await
+            .unwrap();
+        let (da, db) = (FakeDl::default(), FakeDl::default());
+        let (oa, ob) = (queue_opts("a", 2), queue_opts("b", 2));
+        let (ra, rb) = tokio::join!(
+            run_queue(&c, &store, &da, &pa, &f, &oa),
+            run_queue(&c, &store, &db, &pb, &f, &ob),
+        );
+        let (ra, rb) = (ra.unwrap(), rb.unwrap());
+        assert_eq!(ra.fetched + rb.fetched, 8);
+        let mut calls: Vec<_> = da
+            .calls
+            .borrow()
+            .iter()
+            .chain(db.calls.borrow().iter())
+            .cloned()
+            .collect();
+        calls.sort();
+        calls.dedup();
+        assert_eq!(calls.len(), 8);
+        assert_eq!(
+            da.calls.borrow().len() + db.calls.borrow().len(),
+            8,
+            "a video was fetched twice"
+        );
+        let p = f.progress().await.unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!((p[0].state.as_str(), p[0].videos), ("fetched", 8));
+        assert!(store.exists("videos/vi/vid00000007.json").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn queue_retries_failures_then_gives_up() {
+        let Some((f, _dir, store)) = queue_setup(3).await else {
+            return;
+        };
+        let c = Fetch {
+            max_attempts: 2,
+            retry_delay_s: 0,
+            ..cfg()
+        };
+        let pool =
+            egress::SharedPool::new(f.pool().clone(), vec![Egress::direct()], &c, "w".into())
+                .await
+                .unwrap();
+        let dl = FakeDl::default()
+            .on("vid00000000", &[Step::Fail("Postprocessing failed")])
+            .on(
+                "vid00000001",
+                &[Step::Fail("Video unavailable. This video is private")],
+            );
+        let r = run_queue(&c, &store, &dl, &pool, &f, &queue_opts("w", 1))
+            .await
+            .unwrap();
+        assert_eq!((r.fetched, r.unavailable, r.failed), (1, 1, 2));
+        let tries = dl
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| *c == "vid00000000")
+            .count();
+        assert_eq!(tries, 2);
+        let mut p: Vec<_> = f
+            .progress()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.state, p.videos))
+            .collect();
+        p.sort();
+        assert_eq!(
+            p,
+            vec![
+                ("failed".into(), 1),
+                ("fetched".into(), 1),
+                ("unavailable".into(), 1)
+            ]
+        );
     }
 
     #[test]

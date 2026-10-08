@@ -12,25 +12,42 @@ use crate::store::Store;
 
 pub async fn run(cfg: &Config, store: &Store) -> Result<String> {
     let mut out = String::new();
-    if cfg.frontier.exists() {
-        let f = Frontier::open(&cfg.frontier)?;
-        let day = quota_day();
-        let (used, search) = f.quota(&day)?;
-        writeln!(out, "frontier {}", cfg.frontier.display())?;
-        writeln!(
-            out,
-            "  quota {day} (Pacific): {used} / {} used, {search} / {} on search",
-            cfg.discover.daily_quota, cfg.discover.search_quota
-        )?;
-        for (label, n) in f.counts()? {
-            writeln!(out, "  {label:<40} {n:>9}")?;
+    match std::env::var("DATABASE_URL") {
+        Ok(url) => {
+            let f = Frontier::open(&url).await?;
+            let day = quota_day();
+            let (used, search) = f.quota(&day).await?;
+            writeln!(out, "frontier (DATABASE_URL)")?;
+            writeln!(
+                out,
+                "  quota {day} (Pacific): {used} / {} used, {search} / {} on search",
+                cfg.discover.daily_quota, cfg.discover.search_quota
+            )?;
+            for (label, n) in f.counts().await? {
+                writeln!(out, "  {label:<40} {n:>9}")?;
+            }
+            let egress =
+                crate::egress::SharedPool::report(f.pool(), &cfg.fetch.provider_prices).await?;
+            if egress.lines().count() > 1 {
+                writeln!(out, "egress (shared, Postgres)")?;
+                out.push_str(&egress);
+            }
+            let progress = f.progress().await?;
+            if !progress.is_empty() {
+                writeln!(out, "queue")?;
+                for p in progress {
+                    writeln!(
+                        out,
+                        "  {:<12} {:>9} videos {:>9.1} GB {:>9.1} h",
+                        p.state,
+                        p.videos,
+                        p.bytes as f64 / 1e9,
+                        p.duration_s as f64 / 3600.0
+                    )?;
+                }
+            }
         }
-    } else {
-        writeln!(
-            out,
-            "frontier {}: not here (only the coordinator has it)",
-            cfg.frontier.display()
-        )?;
+        Err(_) => writeln!(out, "frontier: DATABASE_URL not set")?,
     }
     if cfg.fetch.egress_db.exists() {
         let h = crate::egress::Health::open(&cfg.fetch.egress_db)?;
