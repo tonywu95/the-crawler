@@ -87,7 +87,7 @@ Every attempt (IP, provider, outcome, bytes, seconds in yt-dlp) goes into the `a
 
 ## Containers
 
-The `Dockerfile` builds a worker image: the binary, plus yt-dlp and deno pinned by `uv.lock`. It defaults to `fetch --queue --jobs 4` and takes `DATABASE_URL`, store credentials and a mounted proxy list; the header comment has an example `docker run`.
+The `Dockerfile` builds a worker image: the binary, plus yt-dlp and deno pinned by `uv.lock`, on `python:3.12-slim-bookworm` (the build needs only Docker Hub, crates.io and PyPI). It defaults to `fetch --queue --jobs 4` and takes `DATABASE_URL`, store credentials and a mounted proxy list; the header comment has an example `docker run`.
 
 ## Tests
 

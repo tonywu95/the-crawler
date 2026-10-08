@@ -15,15 +15,14 @@ COPY Cargo.toml Cargo.lock ./
 COPY src src
 RUN cargo build --release --locked
 
-FROM debian:bookworm-slim
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates python3-pip \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir --break-system-packages uv==0.11.32
+# The image's Python 3.12 satisfies pyproject.toml, so uv needs no managed Python and the
+# build needs nothing but PyPI (no apt, no GitHub downloads).
+FROM python:3.12-slim-bookworm
+RUN pip install --no-cache-dir uv==0.11.32
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
-# uv fetches a managed Python (the project wants >= 3.12) and installs yt-dlp and deno into .venv.
-ENV UV_PYTHON_INSTALL_DIR=/opt/python UV_LINK_MODE=copy
+# yt-dlp and deno (both from PyPI wheels) into .venv/bin, where config/youtube.yaml expects them.
+ENV UV_PYTHON=/usr/local/bin/python3.12 UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy
 RUN uv sync --frozen --no-install-project && uv cache clean
 COPY config config
 COPY --from=build /src/target/release/youtube-crawl /usr/local/bin/youtube-crawl
