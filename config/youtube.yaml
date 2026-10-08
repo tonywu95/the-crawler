@@ -1,0 +1,70 @@
+# youtube-crawl configuration. Every key is optional; missing keys take the defaults in src/config.rs.
+
+# Where batches, media and manifests go. A local path, or s3:// / gs:// (credentials come from the
+# usual AWS_* / GOOGLE_* environment variables). For Cloudflare R2 (no egress fees) use
+# s3://<bucket>/youtube with AWS_ENDPOINT, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY set.
+store: data/youtube
+# The SQLite frontier, used by discover, plan and status on the coordinator.
+frontier: data/frontier.sqlite
+
+discover:
+  daily_quota: 10000        # units per API key per day, reset at midnight Pacific
+  search_quota: 6000        # search.list costs 100 a call; everything else costs 1
+  pages_per_query: 5        # 50 results a page
+  expand_channels: true     # crawl the uploads of channels with an accepted video
+  max_uploads_per_channel: 2000
+  # Searched with videoLicense=creativeCommon. Chosen for footage useful to robotics: hands
+  # manipulating objects, first-person household tasks, tool use, robots.
+  queries:
+    - robot manipulation demo
+    - robot arm pick and place
+    - robot grasping objects
+    - humanoid robot household tasks
+    - teleoperation robot
+    - cooking pov hands
+    - first person cooking no talking
+    - chopping vegetables pov
+    - folding laundry
+    - how to fold clothes
+    - washing dishes by hand
+    - cleaning kitchen timelapse
+    - repair tutorial hands
+    - fixing a bike
+    - electronics repair soldering
+    - furniture assembly
+    - lego assembly hands
+    - woodworking hand tools
+    - using a screwdriver
+    - knot tying tutorial
+  # Channel ids (UC...) or @handles whose uploads are crawled first.
+  channels: []
+  # Individual video ids to check.
+  videos: []
+
+filters:
+  licenses: [creativeCommon]
+  min_duration_s: 10
+  max_duration_s: 3600
+  skip_live: true
+  skip_age_restricted: true
+  skip_made_for_kids: true
+
+plan:
+  shard_size: 500
+
+fetch:
+  ytdlp: .venv/bin/yt-dlp
+  deno: .venv/bin/deno
+  format: "bv[height<=720][vcodec^=avc1]/bv[height<=720]/b[height<=720]"
+  subtitles: [en]           # uploaded and automatic captions, as vtt
+  max_bytes_per_second: 10000000
+  pause_min_s: 4            # each IP rests 4-12 s after a video
+  pause_max_s: 12
+  bot_check_backoff_s: 300  # an IP is benched after a bot check, 429 or proxy failure;
+  bot_check_backoff_max_s: 86400   # the bench doubles per strike in a row, up to a day
+  bot_check_limit: 3        # strikes in a row retire the IP; all retired stops the worker
+  error_limit: 20           # other failures in a row before the worker stops
+  # proxies: config/proxies.txt   # `<provider> <url>` per line; unset = this machine's address
+  max_videos_per_ip_per_hour: 0   # 0 = no cap
+  egress_db: data/egress.sqlite   # per-IP health and every attempt, for the trial report
+  provider_prices: {}       # USD per IP per month, e.g. {acme: 1.5}, for $/hour in status
