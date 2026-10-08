@@ -3,6 +3,7 @@
 mod api;
 mod config;
 mod discover;
+mod egress;
 mod fetch;
 mod frontier;
 mod plan;
@@ -55,6 +56,12 @@ enum Command {
         /// Only this batch.
         #[arg(long)]
         batch: Option<String>,
+        /// Proxy list (`<provider> <url>` per line); overrides fetch.proxies.
+        #[arg(long)]
+        proxies: Option<PathBuf>,
+        /// Forget every IP's strikes, benches and retirements before starting.
+        #[arg(long)]
+        reset_egress: bool,
     },
     /// Frontier counts, today's quota, and per-batch progress.
     Status,
@@ -110,13 +117,36 @@ async fn main() -> Result<()> {
             world,
             jobs,
             batch,
+            proxies,
+            reset_egress,
         } => {
             let store = store::Store::open(&cfg.store)?;
             let dl = fetch::YtDlp::new(&cfg.fetch)?;
+            let list = match proxies.or(cfg.fetch.proxies.clone()) {
+                Some(path) => egress::load_list(&path)?,
+                None => vec![egress::Egress::direct()],
+            };
+            let health = egress::Health::open(&cfg.fetch.egress_db)?;
+            if reset_egress {
+                health.reset()?;
+            }
+            let pool = egress::Pool::new(list, &cfg.fetch, health, format!("{rank}/{world}"))?;
+            eprintln!(
+                "fetch: {} egress IPs ({} retired)",
+                pool.len(),
+                pool.retired()
+            );
+            if jobs > pool.len() {
+                eprintln!(
+                    "fetch: {jobs} jobs but {} IPs; an IP serves one video at a time",
+                    pool.len()
+                );
+            }
             let r = fetch::run(
                 &cfg.fetch,
                 &store,
                 &dl,
+                &pool,
                 &fetch::Options {
                     rank,
                     world,
@@ -126,12 +156,13 @@ async fn main() -> Result<()> {
             )
             .await?;
             println!(
-                "fetch: {} shards done; {} fetched, {} already had, {} unavailable, {} failed; {:.2} GB",
+                "fetch: {} shards done; {} fetched, {} already had, {} unavailable, {} failed, {} strikes; {:.2} GB",
                 r.shards,
                 r.fetched,
                 r.skipped,
                 r.unavailable,
                 r.failed,
+                r.strikes,
                 r.bytes as f64 / 1e9
             );
         }

@@ -2,7 +2,7 @@
 
 A YouTube crawler for Creative Commons video, written in Rust. Its output feeds Astra's data mixes.
 
-Status: all four commands are written and unit-tested against a fake API and a fake downloader. Not yet run against the live API or YouTube.
+Status: all four commands are written and unit-tested against a fake API and a fake downloader, and fetch can spread downloads over a proxy list (design phase 1). Not yet run against the live API or YouTube.
 
 ## Design
 
@@ -31,7 +31,7 @@ Restarts are exact. A worker skips any shard that has a manifest and any video t
 ## Rules it follows
 
 - **License.** Only videos whose API `status.license` is `creativeCommon` (CC BY 3.0) are accepted. The worker checks again on the watch page just before downloading, and skips the video if the page no longer shows a Creative Commons license. Attribution (title, channel, URL) is kept in every record.
-- **Politeness.** One worker per IP address by default, a random pause after each video, and a per-job rate cap. On "confirm you're not a bot" or HTTP 429 the worker backs off exponentially, then stops after a few in a row. No proxies, cookies, or other ways around YouTube's limits.
+- **Politeness.** One video at a time per IP, a random pause after each, an optional hourly cap per IP, and a per-download rate cap. On "confirm you're not a bot" or HTTP 429 that IP is benched with exponential backoff and retired after a few in a row. Load can be spread over a proxy list (see the design doc); there are no accounts, cookies or CAPTCHA solving.
 - **Quota.** search costs 100 units; videos.list, playlistItems.list and channels.list cost 1 per call of up to 50. The default quota is 10,000 units per day, reset at midnight Pacific. Checking a list of known ids costs about 1 unit per 50, so roughly 500k ids per day per key; search is the expensive path.
 
 ## Verified against YouTube (2026-10-07, yt-dlp 2026.08.19, deno 2.9.7)
@@ -59,12 +59,19 @@ $B discover --ids-file ids.txt      # also check known ids (ids or watch URLs, o
 $B plan                             # accepted videos → batches/<batch>/shard-*.jsonl
 $B fetch                            # one worker, one download at a time
 $B fetch --rank 2 --world 8         # worker 2 of 8, each on its own IP
+$B fetch --proxies config/proxies.txt --jobs 8   # downloads spread over a proxy list
 $B status
 ```
 
 `discover` runs in this order: check unchecked ids, crawl seed channels, crawl channels (checking new ids after each one), search up to `search_quota`, crawl the channels search turned up, then check again. When the quota runs out it stops cleanly. `plan` puts direct hits (search, seed ids, seed channels) ahead of channel-expansion hits.
 
-`fetch` exits non-zero when it stops early: after `bot_check_limit` bot checks or 429s in a row (waiting `bot_check_backoff_s`, doubling, between them, with every slot paused), or after `error_limit` other failures in a row. The shard it was on keeps no manifest, so the next run picks it up again. An unavailable video (private, removed, region-locked, members-only, age-gated) goes into the manifest as `unavailable` and does not count toward the error streak.
+`fetch` sends each download through an egress IP leased from a pool: the proxies in `fetch.proxies` (or `--proxies`), or the machine's own address if there are none. The lease covers the whole video, because YouTube signs the media URL for the IP that loaded the page. An IP serves one video at a time, so `--jobs` beyond the number of IPs adds nothing. After a video the IP rests `pause_min_s`–`pause_max_s` seconds, and `max_videos_per_ip_per_hour` caps it if set. A bot check, a 429 or a proxy failure is a strike: the IP is benched for `bot_check_backoff_s`, doubling per strike in a row up to `bot_check_backoff_max_s`, and the video is retried on another IP. After `bot_check_limit` strikes in a row the IP is retired, which persists across runs until `fetch --reset-egress`.
+
+`fetch` exits non-zero when it stops early: when every IP is retired, or after `error_limit` other failures in a row. The shard it was on keeps no manifest, so the next run picks it up again.
+
+The proxy list has one proxy per line, `<provider> <url>`, for example `acme http://user:pass@gw.acme.net:7000`; `config/proxies*.txt` is git-ignored. Logs, manifests and the health database name a proxy only by its label, `acme/gw.acme.net:7000#1`, never by its URL. The URL is passed to yt-dlp on its command line, so it is visible to other users of the same machine.
+
+Every attempt (IP, provider, outcome, bytes, seconds in yt-dlp) goes into `fetch.egress_db` on the worker. `status` turns that into the proxy trial's comparison: for each provider, IPs, retired, tries, fetched, strike rate, MB/s, videos per IP per day, hours fetched and, given `provider_prices`, $ per hour of video. An unavailable video (private, removed, region-locked, members-only, age-gated) goes into the manifest as `unavailable` and does not count toward the error streak.
 
 `--store` overrides the store on the command line. For S3-compatible stores (R2 included), set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and, for R2, `AWS_ENDPOINT`. They are read from the environment.
 

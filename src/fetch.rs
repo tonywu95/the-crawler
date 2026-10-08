@@ -1,21 +1,22 @@
 //! fetch: a worker downloads its share of every batch's shards with yt-dlp.
 //!
 //! Worker `rank` of `world` runs `jobs` slots; slot s = rank × jobs + j takes the shards whose
-//! index i (across all batches, oldest first) has i % (world × jobs) == s. The slots share one
-//! task and one IP, so a bot check seen by any of them pauses all of them.
+//! index i (across all batches, oldest first) has i % (world × jobs) == s. Each download leases
+//! an egress IP from the worker's pool (see egress.rs) for the whole video, so the watch page and
+//! the media come through the same address. A bot check benches that IP and the video is tried
+//! again on another; the worker stops when every IP is retired.
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tokio::time::Instant;
 
 use crate::config::Fetch;
+use crate::egress::{Pool, Use};
 use crate::plan::{self, Entry};
 use crate::store::Store;
 
@@ -26,8 +27,13 @@ pub struct Outcome {
 }
 
 pub trait Downloader {
-    /// Downloads `entry` into the empty directory `dir`.
-    fn download(&self, entry: &Entry, dir: &Path) -> impl Future<Output = Result<Outcome>>;
+    /// Downloads `entry` into the empty directory `dir`, through `proxy` if given.
+    fn download(
+        &self,
+        entry: &Entry,
+        dir: &Path,
+        proxy: Option<&str>,
+    ) -> impl Future<Output = Result<Outcome>>;
 }
 
 pub struct YtDlp {
@@ -49,7 +55,7 @@ impl YtDlp {
 }
 
 impl Downloader for YtDlp {
-    async fn download(&self, entry: &Entry, dir: &Path) -> Result<Outcome> {
+    async fn download(&self, entry: &Entry, dir: &Path, proxy: Option<&str>) -> Result<Outcome> {
         let deno = std::path::absolute(&self.cfg.deno)?;
         let mut cmd = tokio::process::Command::new(&self.cfg.ytdlp);
         cmd.args([
@@ -77,6 +83,11 @@ impl Downloader for YtDlp {
             ])
             .arg(self.cfg.subtitles.join(","));
         }
+        if let Some(p) = proxy {
+            // Every request, the media included, goes through it: the media URL is signed for
+            // the IP that loaded the page. The URL never reaches our logs (see Egress::redact).
+            cmd.arg("--proxy").arg(p);
+        }
         cmd.arg("-o")
             .arg(dir.join("%(id)s.%(ext)s"))
             .arg("--")
@@ -98,6 +109,8 @@ impl Downloader for YtDlp {
 
 #[derive(Debug, PartialEq)]
 pub enum Failure {
+    /// The proxy failed: connect, tunnel or authentication.
+    Proxy(String),
     /// "Confirm you're not a bot", HTTP 429, rate limiting: the IP is being throttled.
     BotCheck(String),
     /// The video itself can't be had: private, removed, region-locked, members-only, age-gated.
@@ -117,6 +130,13 @@ pub fn classify(stderr: &str) -> Failure {
         .chars()
         .take(300)
         .collect::<String>();
+    const PROXY: &[&str] = &[
+        "unable to connect to proxy",
+        "tunnel connection failed",
+        "proxyerror",
+        "proxy authentication required",
+        "socks",
+    ];
     const BOT: &[&str] = &[
         "not a bot",
         "http error 429",
@@ -140,7 +160,9 @@ pub fn classify(stderr: &str) -> Failure {
         "premieres in",
         "live event will begin",
     ];
-    if BOT.iter().any(|p| lower.contains(p)) {
+    if PROXY.iter().any(|p| lower.contains(p)) {
+        Failure::Proxy(reason)
+    } else if BOT.iter().any(|p| lower.contains(p)) {
         Failure::BotCheck(reason)
     } else if GONE.iter().any(|p| lower.contains(p)) {
         Failure::Unavailable(reason)
@@ -205,6 +227,8 @@ pub struct Report {
     pub skipped: usize,
     pub unavailable: usize,
     pub failed: usize,
+    /// Bot checks, 429s and proxy failures; each video is retried on another IP.
+    pub strikes: usize,
     pub bytes: u64,
 }
 
@@ -213,9 +237,9 @@ struct Shared<'a> {
     cfg: &'a Fetch,
     store: &'a Store,
     worker: String,
+    pool: &'a Pool,
     stop: RefCell<Option<String>>,
-    pause_until: Cell<Option<Instant>>,
-    bot_streak: Cell<u32>,
+    last_strike: RefCell<String>,
     error_streak: Cell<u32>,
     report: RefCell<Report>,
 }
@@ -224,6 +248,7 @@ pub async fn run<D: Downloader>(
     cfg: &Fetch,
     store: &Store,
     downloader: &D,
+    pool: &Pool,
     opts: &Options,
 ) -> Result<Report> {
     if opts.world == 0 || opts.jobs == 0 || opts.rank >= opts.world {
@@ -240,9 +265,9 @@ pub async fn run<D: Downloader>(
         cfg,
         store,
         worker: format!("{}/{}", opts.rank, opts.world),
+        pool,
         stop: RefCell::new(None),
-        pause_until: Cell::new(None),
-        bot_streak: Cell::new(0),
+        last_strike: RefCell::new(String::new()),
         error_streak: Cell::new(0),
         report: RefCell::new(Report::default()),
     };
@@ -324,83 +349,117 @@ async fn fetch_one<D: Downloader>(
         )));
     }
     loop {
-        if let Some(until) = sh.pause_until.get() {
-            tokio::time::sleep_until(until).await;
-        }
         if sh.stop.borrow().is_some() {
             return Ok(None);
         }
+        let Some(lease) = sh.pool.lease().await else {
+            if sh.pool.retired() == sh.pool.len() {
+                stop(
+                    sh,
+                    format!(
+                        "all {} egress IPs retired after {} strikes in a row (bot checks, 429s, proxy errors); last: {}",
+                        sh.pool.len(),
+                        sh.cfg.bot_check_limit,
+                        sh.last_strike.borrow()
+                    ),
+                );
+            }
+            return Ok(None);
+        };
+        let label = lease.egress.label.clone();
         let dir = tempfile::tempdir()?;
-        let outcome = dl.download(entry, dir.path()).await?;
+        let outcome = match dl
+            .download(entry, dir.path(), lease.egress.url.as_deref())
+            .await
+        {
+            Ok(o) => Outcome {
+                stderr: lease.egress.redact(&o.stderr),
+                ..o
+            },
+            Err(e) => {
+                sh.pool.release(lease, &v.id, Use::Failed)?;
+                return Err(e);
+            }
+        };
         let media = if outcome.success {
             find_media(dir.path(), &v.id)?
         } else {
             None
         };
-        let result = match (outcome.success, media) {
+        let (how, result) = match (outcome.success, media) {
             (true, Some(media)) => {
-                sh.bot_streak.set(0);
+                let bytes = local_bytes(dir.path(), &v.id)?;
+                let how = Use::Fetched {
+                    bytes,
+                    duration_s: v.duration_s,
+                };
+                // The IP is done once the files are local; it rests while we upload.
+                sh.pool.release(lease, &v.id, how)?;
                 sh.error_streak.set(0);
                 let bytes =
                     upload(sh, entry, dir.path(), &media, batch, shard, &record_path).await?;
                 let mut r = sh.report.borrow_mut();
                 r.fetched += 1;
                 r.bytes += bytes;
-                eprintln!("fetch: {} ok, {:.1} MB", v.id, bytes as f64 / 1e6);
-                line("fetched", None, bytes)
+                eprintln!(
+                    "fetch: {} ok via {label}, {:.1} MB",
+                    v.id,
+                    bytes as f64 / 1e6
+                );
+                return Ok(Some(line("fetched", None, bytes)));
             }
             // Exit 0 without a file: the page did not show a Creative Commons license. If that
             // happens to every video, YouTube changed its page, so it counts toward the streak.
-            (true, None) => error(
-                sh,
-                line("failed", Some("page license check failed".into()), 0),
+            (true, None) => (
+                Use::Failed,
+                error(
+                    sh,
+                    line("failed", Some("page license check failed".into()), 0),
+                ),
             ),
             (false, _) => match classify(&outcome.stderr) {
-                Failure::BotCheck(reason) => {
-                    let n = sh.bot_streak.get() + 1;
-                    sh.bot_streak.set(n);
-                    if n >= sh.cfg.bot_check_limit {
-                        stop(sh, format!("{n} bot checks in a row; last: {reason}"));
-                        return Ok(None);
-                    }
-                    let wait = Duration::from_secs(
-                        sh.cfg
-                            .bot_check_backoff_s
-                            .saturating_mul(1 << (n - 1).min(16)),
-                    );
-                    eprintln!(
-                        "fetch: {}: bot check ({reason}); all slots pause {wait:?}",
-                        v.id
-                    );
-                    let until = Instant::now() + wait;
-                    if sh.pause_until.get().is_none_or(|u| u < until) {
-                        sh.pause_until.set(Some(until));
-                    }
-                    continue;
+                failure @ (Failure::BotCheck(_) | Failure::Proxy(_)) => {
+                    let (how, reason) = match failure {
+                        Failure::Proxy(r) => (Use::ProxyError, r),
+                        Failure::BotCheck(r) => (Use::BotCheck, r),
+                        _ => unreachable!(),
+                    };
+                    let note = sh.pool.release(lease, &v.id, how)?.unwrap_or_default();
+                    sh.report.borrow_mut().strikes += 1;
+                    eprintln!("fetch: {} via {label}: {reason}; {note}", v.id);
+                    *sh.last_strike.borrow_mut() = reason;
+                    continue; // the same video, on another IP or after the bench
                 }
                 Failure::Unavailable(reason) => {
-                    sh.bot_streak.set(0);
                     sh.report.borrow_mut().unavailable += 1;
                     eprintln!("fetch: {} unavailable: {reason}", v.id);
-                    line("unavailable", Some(reason), 0)
+                    (Use::Unavailable, line("unavailable", Some(reason), 0))
                 }
-                Failure::Error(reason) => error(sh, line("failed", Some(reason), 0)),
+                Failure::Error(reason) => (Use::Failed, error(sh, line("failed", Some(reason), 0))),
             },
         };
+        sh.pool.release(lease, &v.id, how)?;
         if sh.stop.borrow().is_some() {
             return Ok(None);
         }
-        let (lo, hi) = (
-            sh.cfg.pause_min_s,
-            sh.cfg.pause_max_s.max(sh.cfg.pause_min_s),
-        );
-        tokio::time::sleep(Duration::from_secs_f64(rand::random_range(lo..=hi))).await;
         return Ok(Some(result));
     }
 }
 
+/// Bytes of the media and captions yt-dlp left for `id`.
+fn local_bytes(dir: &Path, id: &str) -> Result<u64> {
+    let mut total = 0;
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&format!("{id}.")) && !name.ends_with(".part") {
+            total += e.metadata()?.len();
+        }
+    }
+    Ok(total)
+}
+
 fn error(sh: &Shared<'_>, line: ManifestLine) -> ManifestLine {
-    sh.bot_streak.set(0);
     let n = sh.error_streak.get() + 1;
     sh.error_streak.set(n);
     sh.report.borrow_mut().failed += 1;
@@ -424,6 +483,7 @@ fn error(sh: &Shared<'_>, line: ManifestLine) -> ManifestLine {
 fn stop(sh: &Shared<'_>, why: String) {
     eprintln!("fetch: stopping: {why}");
     sh.stop.borrow_mut().get_or_insert(why);
+    sh.pool.close();
 }
 
 /// The downloaded media file: <id>.<ext>, not a caption or partial file.
@@ -506,14 +566,17 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::egress::{self, Egress, Health};
     use crate::frontier::Frontier;
     use crate::plan::tests::video;
 
-    /// Plays a script per video id; the last step repeats. Records every call.
+    /// Plays a script per video id; the last step repeats. Records every call and the proxy it
+    /// came through. Proxies whose URL contains "bad" always get a bot check.
     #[derive(Default)]
     struct FakeDl {
         script: HashMap<String, Vec<Step>>,
         calls: RefCell<Vec<String>>,
+        proxies: RefCell<Vec<Option<String>>>,
     }
 
     #[derive(Clone, Copy)]
@@ -531,10 +594,22 @@ mod tests {
     }
 
     impl Downloader for FakeDl {
-        async fn download(&self, entry: &Entry, dir: &Path) -> Result<Outcome> {
+        async fn download(
+            &self,
+            entry: &Entry,
+            dir: &Path,
+            proxy: Option<&str>,
+        ) -> Result<Outcome> {
             let id = &entry.video.id;
             let n = self.calls.borrow().iter().filter(|c| *c == id).count();
             self.calls.borrow_mut().push(id.clone());
+            self.proxies.borrow_mut().push(proxy.map(str::to_string));
+            if proxy.is_some_and(|p| p.contains("bad")) {
+                return Ok(Outcome {
+                    success: false,
+                    stderr: format!("ERROR: [youtube] {id}: Sign in to confirm you're not a bot"),
+                });
+            }
             let steps = self
                 .script
                 .get(id)
@@ -556,7 +631,11 @@ mod tests {
                 },
                 Step::Fail(msg) => Outcome {
                     success: false,
-                    stderr: format!("WARNING: x\nERROR: [youtube] {id}: {msg}\n"),
+                    stderr: format!(
+                        "WARNING: x via {}\nERROR: [youtube] {id}: {msg} (via {})\n",
+                        proxy.unwrap_or("-"),
+                        proxy.unwrap_or("-")
+                    ),
                 },
             })
         }
@@ -569,6 +648,20 @@ mod tests {
             bot_check_backoff_s: 0,
             ..Fetch::default()
         }
+    }
+
+    fn pool(list: Vec<Egress>, c: &Fetch) -> Pool {
+        Pool::new(list, c, Health::memory().unwrap(), "test".into()).unwrap()
+    }
+
+    /// fetch::run through the machine's own address, as before proxies.
+    async fn run_direct<D: Downloader>(
+        c: &Fetch,
+        store: &Store,
+        dl: &D,
+        o: &Options,
+    ) -> Result<Report> {
+        run(c, store, dl, &pool(vec![Egress::direct()], c), o).await
     }
 
     fn opts(rank: usize, world: usize, jobs: usize) -> Options {
@@ -624,6 +717,12 @@ mod tests {
             Failure::Unavailable(_)
         ));
         assert!(matches!(
+            classify(
+                "ERROR: [youtube] x: Unable to download API page: ('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden'))"
+            ),
+            Failure::Proxy(_)
+        ));
+        assert!(matches!(
             classify("ERROR: [youtube] x: Postprocessing: Conversion failed!"),
             Failure::Error(_)
         ));
@@ -642,7 +741,9 @@ mod tests {
     async fn fetches_everything_and_resumes_exactly() {
         let (_dir, store, batch) = setup(5, 2).await;
         let dl = FakeDl::default();
-        let r = run(&cfg(), &store, &dl, &opts(0, 1, 2)).await.unwrap();
+        let r = run_direct(&cfg(), &store, &dl, &opts(0, 1, 2))
+            .await
+            .unwrap();
         assert_eq!((r.shards, r.fetched, r.failed), (3, 5, 0));
         let id = "vid00000003";
         let rec: Record = serde_json::from_slice(
@@ -662,7 +763,9 @@ mod tests {
 
         // Every shard has a manifest, so a rerun does nothing.
         let dl2 = FakeDl::default();
-        let r = run(&cfg(), &store, &dl2, &opts(0, 1, 2)).await.unwrap();
+        let r = run_direct(&cfg(), &store, &dl2, &opts(0, 1, 2))
+            .await
+            .unwrap();
         assert_eq!(r.shards, 0);
         assert!(dl2.calls.borrow().is_empty());
     }
@@ -671,14 +774,18 @@ mod tests {
     async fn workers_split_shards() {
         let (_dir, store, batch) = setup(6, 1).await;
         let dl = FakeDl::default();
-        let r = run(&cfg(), &store, &dl, &opts(1, 3, 1)).await.unwrap();
+        let r = run_direct(&cfg(), &store, &dl, &opts(1, 3, 1))
+            .await
+            .unwrap();
         assert_eq!(r.shards, 2);
         assert_eq!(*dl.calls.borrow(), vec!["vid00000001", "vid00000004"]);
         assert!(store.exists(&plan::manifest_path(&batch, 4)).await.unwrap());
         assert!(!store.exists(&plan::manifest_path(&batch, 0)).await.unwrap());
 
         let dl = FakeDl::default();
-        run(&cfg(), &store, &dl, &opts(0, 2, 1)).await.unwrap(); // a different split: 0, 2, 4
+        run_direct(&cfg(), &store, &dl, &opts(0, 2, 1))
+            .await
+            .unwrap(); // a different split: 0, 2, 4
         assert_eq!(*dl.calls.borrow(), vec!["vid00000000", "vid00000002"]); // 4 already done
     }
 
@@ -693,7 +800,9 @@ mod tests {
                 )],
             )
             .on("vid00000001", &[Step::LicenseMiss]);
-        let r = run(&cfg(), &store, &dl, &opts(0, 1, 1)).await.unwrap();
+        let r = run_direct(&cfg(), &store, &dl, &opts(0, 1, 1))
+            .await
+            .unwrap();
         assert_eq!((r.fetched, r.unavailable, r.failed), (1, 1, 1));
         let m = manifest(&store, &batch, 0).await;
         let status: Vec<_> = m.iter().map(|l| l.status.as_str()).collect();
@@ -707,7 +816,9 @@ mod tests {
         let (_dir, store, _) = setup(2, 2).await;
         let bot = Step::Fail("Sign in to confirm you're not a bot");
         let dl = FakeDl::default().on("vid00000000", &[bot, bot, Step::Ok]);
-        let r = run(&cfg(), &store, &dl, &opts(0, 1, 1)).await.unwrap();
+        let r = run_direct(&cfg(), &store, &dl, &opts(0, 1, 1))
+            .await
+            .unwrap();
         assert_eq!(r.fetched, 2);
         assert_eq!(dl.calls.borrow().len(), 4);
     }
@@ -719,14 +830,21 @@ mod tests {
             "vid00000001",
             &[Step::Fail("HTTP Error 429: Too Many Requests")],
         );
-        let e = run(&cfg(), &store, &dl, &opts(0, 1, 1)).await.unwrap_err();
-        assert!(e.to_string().contains("3 bot checks in a row"), "{e}");
+        let e = run_direct(&cfg(), &store, &dl, &opts(0, 1, 1))
+            .await
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("retired after 3 strikes in a row"),
+            "{e}"
+        );
         assert_eq!(dl.calls.borrow().len(), 4); // vid0 once, vid1 three times, then stop
         assert!(!store.exists(&plan::manifest_path(&batch, 0)).await.unwrap());
 
         // Next run: vid0 is skipped by its record, vid1 now works.
         let dl = FakeDl::default();
-        let r = run(&cfg(), &store, &dl, &opts(0, 1, 1)).await.unwrap();
+        let r = run_direct(&cfg(), &store, &dl, &opts(0, 1, 1))
+            .await
+            .unwrap();
         assert_eq!((r.skipped, r.fetched, r.shards), (1, 3, 2));
         assert_eq!(dl.calls.borrow()[0], "vid00000001");
         assert_eq!(manifest(&store, &batch, 0).await[0].status, "fetched");
@@ -743,9 +861,95 @@ mod tests {
             error_limit: 4,
             ..cfg()
         };
-        let e = run(&c, &store, &dl, &opts(0, 1, 1)).await.unwrap_err();
+        let e = run_direct(&c, &store, &dl, &opts(0, 1, 1))
+            .await
+            .unwrap_err();
         assert!(e.to_string().contains("4 failures in a row"), "{e}");
         assert_eq!(dl.calls.borrow().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn rotates_across_proxies() {
+        let (_dir, store, _) = setup(6, 6).await;
+        let list =
+            egress::parse_list("a http://10.0.0.1:1\nb http://10.0.0.2:1\nc http://10.0.0.3:1\n")
+                .unwrap();
+        let dl = FakeDl::default();
+        let r = run(&cfg(), &store, &dl, &pool(list, &cfg()), &opts(0, 1, 1))
+            .await
+            .unwrap();
+        assert_eq!(r.fetched, 6);
+        let used: Vec<_> = dl
+            .proxies
+            .borrow()
+            .iter()
+            .map(|p| p.clone().unwrap())
+            .collect();
+        let want: Vec<_> = (0..6)
+            .map(|i| format!("http://10.0.0.{}:1", i % 3 + 1))
+            .collect();
+        assert_eq!(used, want);
+    }
+
+    #[tokio::test]
+    async fn retires_a_flagged_proxy_and_retries_elsewhere() {
+        let (_dir, store, batch) = setup(4, 4).await;
+        let list =
+            egress::parse_list("bad http://bad.example:1\ngood http://good.example:1\n").unwrap();
+        let c = Fetch {
+            bot_check_limit: 2,
+            ..cfg()
+        };
+        let health = Health::memory().unwrap();
+        let p = Pool::new(list, &c, health, "test".into()).unwrap();
+        let dl = FakeDl::default();
+        let r = run(&c, &store, &dl, &p, &opts(0, 1, 1)).await.unwrap();
+        assert_eq!((r.fetched, r.strikes, r.failed), (4, 2, 0));
+        assert_eq!(p.retired(), 1);
+        // bad, good (v0); bad again (v1) retires it; then good for the rest.
+        let used: Vec<_> = dl
+            .proxies
+            .borrow()
+            .iter()
+            .map(|p| p.clone().unwrap().contains("bad"))
+            .collect();
+        assert_eq!(used, vec![true, false, true, false, false, false]);
+        assert!(
+            manifest(&store, &batch, 0)
+                .await
+                .iter()
+                .all(|l| l.status == "fetched")
+        );
+    }
+
+    #[tokio::test]
+    async fn stops_when_every_proxy_is_retired() {
+        let (_dir, store, batch) = setup(2, 2).await;
+        let list = egress::parse_list("x http://bad1:1\nx http://bad2:1\n").unwrap();
+        let dl = FakeDl::default();
+        let e = run(&cfg(), &store, &dl, &pool(list, &cfg()), &opts(0, 1, 1))
+            .await
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("all 2 egress IPs retired after 3"),
+            "{e}"
+        );
+        assert_eq!(dl.calls.borrow().len(), 6);
+        assert!(!store.exists(&plan::manifest_path(&batch, 0)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn keeps_proxy_credentials_out_of_manifests() {
+        let (_dir, store, batch) = setup(1, 1).await;
+        let list = egress::parse_list("acme http://user:s3cret@gw.acme.net:7000\n").unwrap();
+        let dl = FakeDl::default().on("vid00000000", &[Step::Fail("Postprocessing failed")]);
+        run(&cfg(), &store, &dl, &pool(list, &cfg()), &opts(0, 1, 1))
+            .await
+            .unwrap();
+        let m = manifest(&store, &batch, 0).await;
+        let reason = m[0].reason.as_deref().unwrap();
+        assert!(reason.contains("acme/gw.acme.net:7000#1"), "{reason}");
+        assert!(!reason.contains("s3cret"), "{reason}");
     }
 
     #[test]

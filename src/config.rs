@@ -1,5 +1,6 @@
 //! config/youtube.yaml. Every field has a default, so a partial file (or none) works.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -62,14 +63,26 @@ pub struct Fetch {
     pub format: String,
     pub subtitles: Vec<String>,
     pub max_bytes_per_second: u64,
+    /// An IP rests a random time in this range after each video.
     pub pause_min_s: f64,
     pub pause_max_s: f64,
-    /// First wait after a bot check or 429; doubles on each one in a row.
+    /// An IP is benched this long after a bot check, 429 or proxy failure; doubles on each one
+    /// in a row, up to bot_check_backoff_max_s.
     pub bot_check_backoff_s: u64,
-    /// Bot checks in a row before the worker stops.
+    pub bot_check_backoff_max_s: u64,
+    /// Strikes in a row before an IP is retired. The worker stops once every IP is retired.
     pub bot_check_limit: u32,
     /// Other failures in a row before the worker stops.
     pub error_limit: u32,
+    /// A proxy list, one per line: `<provider> <url>`. Unset: the machine's own address.
+    /// Keep it out of git (it holds credentials); config/proxies*.txt is ignored.
+    pub proxies: Option<PathBuf>,
+    /// Videos one IP may start per hour; 0 for no cap.
+    pub max_videos_per_ip_per_hour: u32,
+    /// Per-IP health and the attempt log, on this worker.
+    pub egress_db: PathBuf,
+    /// USD per IP per month, by provider, for the $ per hour column in `status`.
+    pub provider_prices: BTreeMap<String, f64>,
 }
 
 impl Default for Config {
@@ -130,8 +143,13 @@ impl Default for Fetch {
             pause_min_s: 4.0,
             pause_max_s: 12.0,
             bot_check_backoff_s: 300,
+            bot_check_backoff_max_s: 86_400,
             bot_check_limit: 3,
             error_limit: 20,
+            proxies: None,
+            max_videos_per_ip_per_hour: 0,
+            egress_db: "data/egress.sqlite".into(),
+            provider_prices: BTreeMap::new(),
         }
     }
 }

@@ -32,6 +32,15 @@ pub async fn run(cfg: &Config, store: &Store) -> Result<String> {
             cfg.frontier.display()
         )?;
     }
+    if cfg.fetch.egress_db.exists() {
+        let h = crate::egress::Health::open(&cfg.fetch.egress_db)?;
+        writeln!(
+            out,
+            "egress {} (this worker)",
+            cfg.fetch.egress_db.display()
+        )?;
+        out.push_str(&h.report(&cfg.fetch.provider_prices)?);
+    }
     writeln!(out, "store {}", store.url())?;
     let batches = plan::batches(store).await?;
     if batches.is_empty() {
