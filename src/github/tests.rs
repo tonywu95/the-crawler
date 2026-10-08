@@ -1,5 +1,7 @@
 //! discover → plan → fetch → status against a fake GitHub (GraphQL and codeload).
 
+use std::collections::BTreeMap;
+use std::io::Read;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -7,6 +9,7 @@ use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use super::fetch::tests::tarball;
+use super::fetch::{RepoRecord, files_path};
 use super::frontier::Frontier;
 use super::{discover, fetch, plan, status};
 use crate::store::Store;
@@ -47,6 +50,10 @@ impl Respond for FakeGraphql {
         let mut errors = Vec::new();
         if query.contains("search(") {
             let q = vars["q"].as_str().unwrap();
+            assert!(
+                q.starts_with("language:rust license:mit"),
+                "searches are expanded per accepted license: {q}"
+            );
             data["search"] = if !q.contains("created:") {
                 // Too many to return: discover must split this by date.
                 let mut p = page(vec![repo(100, "MIT")], None);
@@ -101,25 +108,49 @@ impl Respond for FakeGraphql {
     }
 }
 
-/// Serves each repository's tarball; some are broken on purpose.
+/// Serves each repository's tarball: its own code, a file every repository shares, and files
+/// that must not be kept. Some repositories are broken on purpose.
 struct FakeCodeload;
 
 impl Respond for FakeCodeload {
     fn respond(&self, req: &Request) -> ResponseTemplate {
         let parts: Vec<&str> = req.url.path().split('/').collect(); // ["", owner, name, "tar.gz", sha]
-        let id: i64 = parts[2].trim_start_matches('r').parse().unwrap();
+        let (name, commit) = (parts[2], parts[4]);
+        let id: i64 = name.trim_start_matches('r').parse().unwrap();
+        let own = format!("pub fn f{id}() -> u32 {{\n    {id}\n}}\n");
+        let files = [
+            ("LICENSE", MIT),
+            ("src/lib.rs", own.as_str()),
+            ("src/shared.rs", "pub const SHARED: u32 = 1;\n"),
+            ("vendor/dep/dep.rs", "pub fn dep() {}\n"),
+            (
+                "src/gpl.c",
+                "/* SPDX-License-Identifier: GPL-2.0 */\nint x = 1;\n",
+            ),
+            ("dist/app.min.js", "var a=1;\n"),
+        ];
         let body = match id {
             201 => return ResponseTemplate::new(404),
-            102 => tarball(parts[2], parts[4], &[("COPYING", GPL), ("main.rs", "")]),
-            301 => tarball(parts[2], &sha(999), &[("LICENSE", MIT)]),
-            _ => tarball(
-                parts[2],
-                parts[4],
-                &[("LICENSE", MIT), ("src/lib.rs", "pub fn f() {}")],
+            102 => tarball(
+                name,
+                commit,
+                &[("COPYING", GPL), ("main.rs", "fn main() {}\n")],
             ),
+            301 => tarball(name, &sha(999), &files),
+            _ => tarball(name, commit, &files),
         };
         ResponseTemplate::new(200).set_body_bytes(body)
     }
+}
+
+fn gunzip_lines(bytes: &[u8]) -> Vec<Value> {
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(bytes)
+        .read_to_string(&mut text)
+        .unwrap();
+    text.lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
 }
 
 #[tokio::test]
@@ -148,7 +179,7 @@ async fn crawls_end_to_end() {
     let seeds = dir.path().join("seeds.yaml");
     std::fs::write(
         &seeds,
-        "searches: [\"license:mit language:rust\"]\nowners: [octo-org, ghost]\nrepos: [octo/cat, https://github.com/octo/missing]\n",
+        "searches: [\"language:rust\"]\nowners: [octo-org, ghost]\nrepos: [octo/cat, https://github.com/octo/missing]\naccept:\n  licenses: [MIT]\n",
     )
     .unwrap();
     let db = dir.path().join("frontier.sqlite");
@@ -198,8 +229,8 @@ async fn crawls_end_to_end() {
     };
     let info = plan::run(&plan_args).await.unwrap().unwrap();
     assert_eq!((info.items, info.shards), (8, 3));
-    let first_shard = Store::open(&store)
-        .unwrap()
+    let s = Store::open(&store).unwrap();
+    let first_shard = s
         .get("batches/b1/shard-00000.jsonl")
         .await
         .unwrap()
@@ -219,6 +250,7 @@ async fn crawls_end_to_end() {
         "everything is planned"
     );
 
+    // Shards: [401, 302, 301], [202, 201, 102], [101, 100].
     let fetch_args = || fetch::FetchArgs {
         store: store.clone(),
         batch: "b1".into(),
@@ -231,68 +263,126 @@ async fn crawls_end_to_end() {
         max_rate: None,
         max_archive_bytes: 1 << 20,
         max_errors: 6,
+        keep_archives: true,
     };
     fetch::run(fetch_args()).await.unwrap();
 
-    let s = Store::open(&store).unwrap();
-    let mut manifest = String::new();
+    let mut repos = BTreeMap::new();
+    let mut files = Vec::new();
     for k in 0..3 {
-        manifest.push_str(
-            &String::from_utf8(
-                s.get(&format!("manifests/b1/shard-{k:05}.jsonl"))
-                    .await
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap(),
-        );
-    }
-    let lines: Vec<Value> = manifest
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    let status_of = |id: i64| {
-        let line = lines.iter().find(|l| l["id"] == id).unwrap();
-        format!(
-            "{} {}",
-            line["status"].as_str().unwrap(),
-            line["reason"].as_str().unwrap_or("")
-        )
-    };
-    assert_eq!(lines.len(), 8);
-    for id in [100, 101, 202, 302, 401] {
-        assert_eq!(status_of(id), "fetched ", "{id}");
-    }
-    assert_eq!(status_of(102), "failed license_check:text_mismatch");
-    assert_eq!(status_of(201), "failed not_found");
-    assert_eq!(
-        status_of(301),
-        format!("failed commit_mismatch:{}", sha(999))
-    );
-
-    let record: fetch::Record = serde_json::from_slice(
-        &s.get(&format!("repos/01/401/{}.json", sha(401)))
+        let manifest = s
+            .get(&format!("manifests/b1/shard-{k:05}.jsonl"))
             .await
             .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
+            .unwrap();
+        for line in String::from_utf8(manifest).unwrap().lines() {
+            let record: RepoRecord = serde_json::from_str(line).unwrap();
+            repos.insert(record.repo.id, record);
+        }
+        files.extend(gunzip_lines(
+            &s.get(&files_path("b1", k)).await.unwrap().unwrap(),
+        ));
+    }
+    let outcome = |id: i64| {
+        let r = &repos[&id];
+        format!(
+            "{} {} {}",
+            r.status,
+            r.reason.as_deref().unwrap_or("-"),
+            r.files
+        )
+    };
+    assert_eq!(repos.len(), 8);
+    // The first repository of each shard keeps the shared file; later ones drop it as a duplicate.
+    for (id, kept) in [(401, 2), (302, 1), (202, 2), (101, 2), (100, 1)] {
+        assert_eq!(outcome(id), format!("fetched - {kept}"));
+    }
+    assert_eq!(outcome(102), "failed license_check:text_mismatch 0");
+    assert_eq!(outcome(201), "failed not_found 0");
+    assert_eq!(
+        outcome(301),
+        format!("failed commit_mismatch:{} 0", sha(999))
+    );
+
+    let r302 = &repos[&302];
+    let dropped: Vec<(&str, u64)> = r302.dropped.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    assert_eq!(
+        dropped,
+        vec![
+            ("duplicate", 1),
+            ("file_license", 1),
+            ("generated", 1),
+            ("license_file", 1),
+            ("vendored", 1)
+        ]
+    );
+    assert_eq!(r302.license_file.as_deref(), Some("LICENSE"));
+    assert!(
+        r302.license_text
+            .as_deref()
+            .unwrap()
+            .contains("Permission is hereby granted")
+    );
+
+    assert_eq!(files.len(), 8);
+    let mut paths: Vec<String> = files
+        .iter()
+        .map(|f| {
+            format!(
+                "{} {}",
+                f["repo"].as_str().unwrap(),
+                f["path"].as_str().unwrap()
+            )
+        })
+        .collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![
+            "octo/r100 src/lib.rs",
+            "octo/r101 src/lib.rs",
+            "octo/r101 src/shared.rs",
+            "octo/r202 src/lib.rs",
+            "octo/r202 src/shared.rs",
+            "octo/r302 src/lib.rs",
+            "octo/r401 src/lib.rs",
+            "octo/r401 src/shared.rs",
+        ]
+    );
+    let f = files
+        .iter()
+        .find(|f| f["repo"] == "octo/r401" && f["path"] == "src/lib.rs")
+        .unwrap();
     assert_eq!(
         (
-            record.license_file.as_str(),
-            record.files,
-            record.repo.full_name.as_str()
+            f["language"].as_str(),
+            f["license"].as_str(),
+            f["stars"].as_i64()
         ),
-        ("LICENSE", 2, "octo/r401")
+        (Some("Rust"), Some("MIT"), Some(401))
     );
-    assert!(record.license_text.contains("Permission is hereby granted"));
-    let archive = s.get(&record.archive).await.unwrap().unwrap();
-    assert_eq!(archive.len() as u64, record.archive_bytes);
+    assert_eq!(
+        (f["repo_id"].as_i64(), f["commit"].as_str()),
+        (Some(401), Some(sha(401).as_str()))
+    );
+    assert_eq!(f["text"], "pub fn f401() -> u32 {\n    401\n}\n");
+    assert_eq!(
+        f["blob_id"],
+        hex::encode(super::extract::blob_id(
+            f["text"].as_str().unwrap().as_bytes()
+        ))
+    );
+
+    // --keep-archives kept the tarballs of the repositories that passed, and only those.
     assert!(
-        !s.exists(&format!("repos/02/102/{}.tar.gz", sha(102)))
+        s.exists(&format!("archives/01/401/{}.tar.gz", sha(401)))
             .await
-            .unwrap(),
-        "failed checks store nothing"
+            .unwrap()
+    );
+    assert!(
+        !s.exists(&format!("archives/02/102/{}.tar.gz", sha(102)))
+            .await
+            .unwrap()
     );
 
     // Every shard has a manifest, so a rerun downloads nothing.
@@ -344,6 +434,7 @@ async fn fetch_stops_after_errors_in_a_row_and_resumes() {
         max_rate: None,
         max_archive_bytes: 1 << 20,
         max_errors: 4,
+        keep_archives: false,
     };
     let err = fetch::run(args()).await.unwrap_err();
     assert!(err.to_string().contains("rerun"), "{err:#}");
@@ -354,8 +445,9 @@ async fn fetch_stops_after_errors_in_a_row_and_resumes() {
         !s.exists("manifests/b/shard-00000.jsonl").await.unwrap(),
         "an unfinished shard has no manifest"
     );
+    assert!(!s.exists(&files_path("b", 0)).await.unwrap());
 
-    // Once GitHub answers again, the same command finishes the shard.
+    // Once GitHub answers again, the same command does the whole shard.
     github.reset().await;
     Mock::given(method("GET"))
         .respond_with(FakeCodeload)
@@ -369,5 +461,13 @@ async fn fetch_stops_after_errors_in_a_row_and_resumes() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(manifest.matches("\"fetched\"").count(), 3, "{manifest}");
+    assert_eq!(
+        manifest.matches("\"status\":\"fetched\"").count(),
+        3,
+        "{manifest}"
+    );
+    assert_eq!(
+        gunzip_lines(&s.get(&files_path("b", 0)).await.unwrap().unwrap()).len(),
+        4
+    );
 }

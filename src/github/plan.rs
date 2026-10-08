@@ -32,10 +32,8 @@ pub async fn run(args: &PlanArgs) -> Result<Option<BatchInfo>> {
     }
     let store = Store::open(&args.store)?;
     let batch = args.batch.clone().unwrap_or_else(shards::new_batch_name);
-    // GitHub's disk usage includes history, so this overestimates the snapshots.
-    let est_bytes = lines.iter().map(|m| m.size_kb.max(0) as u64 * 1024).sum();
-    let info =
-        shards::write_batch(&store, "github", &batch, &lines, args.shard_size, est_bytes).await?;
+    // No size estimate: how much text a repository yields is unknown until it is read.
+    let info = shards::write_batch(&store, "github", &batch, &lines, args.shard_size, 0).await?;
     // Marked only once the batch is complete. If this fails, the next plan takes the same
     // repositories again; that duplicates work but loses none.
     db.mark_planned(&lines.iter().map(|m| m.id).collect::<Vec<_>>(), &batch)?;

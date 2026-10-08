@@ -33,7 +33,7 @@ pub async fn run(args: &DiscoverArgs) -> Result<()> {
     let cfg = Config::load(&args.seeds)?;
     let names = cfg.repo_names()?;
     let mut db = Frontier::open(&args.db)?;
-    let added = db.add_seeds(&cfg.searches, &cfg.owners, &names)?;
+    let added = db.add_seeds(&cfg.expanded_searches(), &cfg.owners, &names)?;
     log!("{added} new seeds from {}", args.seeds.display());
 
     let gh = GitHub::new(&args.api_url, &args.token, args.pace)?;

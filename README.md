@@ -2,12 +2,12 @@
 
 Crawlers for openly licensed data, written in Rust. Their output feeds Astra's data mixes.
 
-| Binary | Crawls | Status |
-| --- | --- | --- |
-| `youtube-crawl` | Creative Commons (CC BY) YouTube video | Designed below; no code yet |
-| `github-crawl` | Public GitHub repositories under permissive licenses | Implemented |
+| Binary | Crawls | Produces | Status |
+| --- | --- | --- | --- |
+| `youtube-crawl` | Creative Commons (CC BY) YouTube video | video and captions | Designed below; no code yet |
+| `github-crawl` | Public GitHub repositories under permissive licenses | file-level source text | Implemented |
 
-Both have the same shape (`discover`, `plan`, `fetch`, `status`) and write the same batch, shard and manifest layout. That shared part is in `src/store.rs` and `src/shards.rs`. Give each crawler its own store (a directory, or a prefix such as `s3://bucket/github`), so their batches stay apart.
+Each crawler is designed around its source. They share two pieces. `src/store.rs` writes to a local path, s3:// or gs://. `src/shards.rs` handles batches of shards and their manifests, which let any number of workers split a batch without a coordinator. Give each crawler its own store (a directory, or a prefix such as `s3://bucket/github`).
 
 ## YouTube crawler
 
@@ -49,41 +49,82 @@ Restarts are exact. A worker skips any shard that has a manifest and any video t
 
 ## GitHub crawler
 
-### Design
+For a data mix, the useful unit is the source file, not the repository. `github-crawl` reads each accepted repository at a pinned commit. It keeps the files its authors wrote, in a known language, as readable text, under the repository's license. Each file becomes one JSON line.
 
-Four subcommands of one binary, `github-crawl`:
+### Output
+
+```
+files/<batch>/shard-00000.jsonl.gz       one kept file per line
+manifests/<batch>/shard-00000.jsonl      one repository per line; written last, so it marks the shard done
+batches/<batch>/...                      the plan: which repositories, at which commits
+archives/<id % 100>/<id>/<sha>.tar.gz    the raw tarballs, only with fetch --keep-archives
+```
+
+A file line has these fields:
+
+| Field | |
+| --- | --- |
+| `repo`, `repo_id` | owner/name, and GitHub's numeric id, which survives renames and transfers |
+| `commit`, `license`, `stars` | the snapshot's commit, the repository's SPDX license, and its stars at discovery |
+| `path`, `language`, `size` | language from the file name or extension: 94 languages and formats of code, docs and config |
+| `blob_id` | the git blob sha1, the same id git, GitHub and Software Heritage use: a ready key for exact dedup across shards and crawls |
+| `text` | the file, UTF-8 |
+
+A manifest line has the repository's metadata from discovery (URL, branch, stars, forks, language, topics, description, dates), `status` and `reason`, files and bytes kept, and files dropped by reason. It also holds the license file's name and text, for attribution.
+
+### Commands
 
 | Command | Runs on | Does |
 | --- | --- | --- |
-| `discover` | one coordinator | Spends the token's GraphQL points. Turns seeds (search queries, users and organizations, repository names, name files) into checked repositories in a SQLite frontier: license, fork, mirror, size, stars, and the default branch's head commit. Searches that match more than GitHub's 1,000-result cap are split by creation date until each part fits. |
-| `plan` | the coordinator | Cuts accepted, not-yet-planned repositories into a new batch of shards, most-starred first: `batches/<batch>/shard-NNNNN.jsonl` in the store. |
-| `fetch` | any number of workers | Worker `rank` of `world` (× `--jobs`) takes every shard k with k % slots == slot. It downloads each repository's snapshot from codeload.github.com, checks it, and writes the tarball and a record. Workers need no token, and no coordinator is involved. |
-| `status` | anywhere | Frontier counts and top rejection reasons, GraphQL points left, and per-batch progress and GB, read from manifests. |
+| `discover` | one machine with a token | Spends the token's GraphQL points to turn seeds into checked repositories in a SQLite frontier (see Discovery). Saves its place after every page, so it can be stopped and rerun. |
+| `plan` | the same machine | Cuts accepted repositories not yet in a batch into a new batch of shards, most-starred first. |
+| `fetch` | any number of workers, no token | Worker `rank` of `world` (× `--jobs`) takes every shard k with k % slots == slot. For each repository it downloads `codeload.github.com/<owner>/<name>/tar.gz/<sha>`, runs the checks below, and adds the kept files to the shard's output. Codeload is not the API, so fetching spends no points. |
+| `status` | anywhere | Frontier counts and top rejection reasons, GraphQL points left, and per-batch progress and GB of text, read from manifests. |
 
-Store layout (a local path, or s3:// / gs:// through `object_store`):
+A rerun of `fetch` skips shards that have a manifest and redoes any other from its start. A repository that fails its checks adds nothing to the output.
 
-```
-batches/<batch>/batch.json                 written last by plan
-batches/<batch>/shard-00000.jsonl          one repository per line: id, name, commit, license, stars, language, topics, ...
-repos/<id % 100>/<id>/<sha>.tar.gz         `git archive` of that commit, as codeload serves it
-repos/<id % 100>/<id>/<sha>.json           fetch record, written last: the repository is done once this exists
-manifests/<batch>/shard-00000.jsonl        written when a shard finishes: one line per repository, fetched or failed
-```
+### What is kept
 
-Snapshots are keyed by GitHub's numeric repository id, which survives renames and transfers, and by commit, so a later crawl of the same repository adds a snapshot rather than replacing one. Restarts are exact, as for YouTube. Discover saves its cursor after every page of results. A worker skips any shard that has a manifest and any repository that has a record.
+Repository checks, all of which must pass:
 
-### Rules it follows
+- **License.** GitHub's detected license (`licenseInfo.spdxId`) must be on the seeds file's `accept.licenses`. The default list is MIT, MIT-0, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, 0BSD, Unlicense, CC0-1.0, Zlib and BSL-1.0. "NOASSERTION" (a license GitHub could not identify) and no license are rejected. The snapshot must also have a top-level license file (LICENSE, COPYING, LICENSE-MIT, ...) whose text matches that license, so a stale detection by GitHub doesn't let a relicensed repository through.
+- **Commit.** The commit id `git archive` wrote into the tarball's pax header must be the commit discovery saw.
+- **Kind of repository.** Forks, mirrors, empty, disabled and locked repositories are rejected at discovery. Submodules never come along, since codeload leaves them out.
 
-- **License.** By default, only repositories whose GitHub-detected license (`licenseInfo.spdxId`) is one of MIT, MIT-0, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, 0BSD, Unlicense, CC0-1.0, Zlib or BSL-1.0 are accepted. The list is the seeds file's `accept.licenses`. "NOASSERTION" (a license GitHub could not identify) and no license are rejected. Before keeping a snapshot, the worker checks again: the tarball must have a top-level license file (LICENSE, COPYING, LICENSE-MIT, ...) whose text matches that license. A missing or different license file means the snapshot is not stored. The record keeps that file's text, with the repository's name and URL, for attribution.
-- **What a snapshot is.** The default branch at the commit discover saw, pinned by sha. The worker confirms the commit id in the tarball's pax header matches. Git submodules are not included (codeload leaves them out), so code under other repositories' licenses doesn't come along. Git LFS files are pointer files unless the repository opted in to including LFS objects in its archives.
-- **Politeness.** Discover sends one query at a time, at least 500 ms apart. It sleeps until the hourly reset when fewer than 100 points are left, and waits out secondary rate limits (`retry-after`). Workers run one job per IP address by default, pause randomly for 1 to 3 s after each download, and cap each job at 10 MB/s. On HTTP 403, 429 or 5xx a worker backs off exponentially from 30 s, honoring `retry-after`. It stops after 6 failed requests in a row, leaving the unfinished shard without a manifest so a rerun retries it. No proxies or ways around GitHub's limits.
-- **Points.** A token gets 5,000 GraphQL points an hour. Every query here costs about 1 point and returns up to 100 repositories: a page of search or owner results, or 100 repositories looked up by name. That is roughly 500k repositories checked per hour. `--max-points` caps a run.
+Then file checks, in order. The first that fails is counted in the manifest's `dropped` under its reason:
 
-### Verified against GitHub (2026-10-07)
+| Reason | Drops |
+| --- | --- |
+| `vendored` | other people's code: anything under `node_modules/`, `vendor/`, `third_party/`, `deps/`, `external/`, `Pods/`, `site-packages/`, ... |
+| `generated` | tool output: lock files, `*.min.js`, `*.pb.go`, `*_pb2.py`, directories named like `generated`, and files whose first 4 KB carry a generator marker (`@generated`, "generated … do not edit", "auto-generated") |
+| `unknown_type` | anything outside the language table: images, binaries, archives, fonts, data dumps |
+| `empty`, `too_big` | empty files, and files over 1 MiB (128 KiB for JSON, YAML, XML, TOML and INI) |
+| `binary`, `not_utf8`, `lfs_pointer` | NUL bytes, invalid UTF-8, Git LFS pointer files |
+| `file_license` | a file whose `SPDX-License-Identifier` can only be satisfied by licenses that are neither permissive nor the repository's own. Also code that opens with a GPL, LGPL, AGPL, MPL or EPL notice other than the repository's own. This is the copied-in GPL file in an MIT project. |
+| `long_lines` | code and data with a line over 1,000 characters or lines averaging over 100: minified code, embedded data |
+| `low_alnum` | under 25% alphanumeric characters, whitespace aside |
+| `duplicate` | the same blob as a file already in this shard |
+| `license_file` | top-level license files, which go into the manifest instead |
 
-- `codeload.github.com/<owner>/<name>/tar.gz/<sha>` serves that commit's `git archive`. The top directory is `<name>-<sha>/`, and the pax global header's `comment` is the full commit id. Checked by running `fetch` on this repository's own commit (`ad714df`): downloaded, commit matched, then rejected with `license_check:no_license_file` because this repository has no LICENSE. A made-up commit gets HTTP 404, recorded as `not_found`.
-- The GraphQL queries discover sends (search, owner, batched lookups by name) were validated against GitHub's published schema (`@octokit/graphql-schema` 15.26.1): fields, enum arguments and variable types. They have not run against the live GraphQL API, because it was blocked where this was built. On a first real run, use a small `--max-points` and check the frontier with `status`.
-- `cargo test` runs discover → plan → fetch → status against a fake GitHub. That covers search splitting, pagination, missing names and owners, a 503 retried after `retry-after`, a 404, a commit mismatch, a license-text mismatch, reruns that make no requests, and a worker that stops after errors in a row and resumes.
+Left for downstream: exact dedup across shards (by `blob_id`), near-duplicate removal, scrubbing secrets and personal data, and quality scoring.
+
+### Discovery
+
+- **Searches** are GitHub search queries such as `language:rust stars:>=50`. A query without `license:` runs once per accepted license, so GitHub filters by license before returning anything. Most public repositories have no license, so this avoids spending points on results that would be rejected. A search matching more than the 1,000 results GitHub returns is split by creation date until each part fits.
+- **Owners** (users and organizations), **repos** and **repo_files** (one owner/name per line) are looked up 100 to a query. For coverage beyond what search finds, write lists of names from another source, such as GH Archive, into a repo file.
+- **Points.** A token gets 5,000 GraphQL points an hour. Each query costs about 1 point and returns up to 100 repositories, so roughly 500k repositories are checked per hour. `--max-points` caps a run.
+- **Size.** `accept.max_size_mb` (default 10 GB) bounds GitHub's disk usage, which includes history. `fetch --max-archive-mb` (default 2 GB) bounds the download itself.
+
+### Politeness
+
+Discover sends one query at a time, at least 500 ms apart. It sleeps until the hourly reset when fewer than 100 points are left, and waits out secondary rate limits (`retry-after`). Workers run one job per IP address by default, pause randomly for 1 to 3 s after each download, and cap each job at 10 MB/s. On HTTP 403, 429 or 5xx a worker backs off exponentially from 30 s, honoring `retry-after`, and stops after 6 failed requests in a row. The unfinished shard is then redone on the next run. No proxies or ways around GitHub's limits.
+
+### Verified (2026-10-08)
+
+- **Against codeload.** `codeload.github.com/<owner>/<name>/tar.gz/<sha>` serves that commit's `git archive`. The top directory is `<name>-<sha>/`, and the pax header's `comment` is the full commit id. `fetch` was run live on this repository's commit `ad714df`: downloaded, commit matched, then rejected with `license_check:no_license_file`, since this repository has no LICENSE. A made-up commit gets HTTP 404, recorded as `not_found`.
+- **On real code.** Seven crates (serde_json, tokio, ring, aws-lc-sys, object_store, rusqlite, tar) were made into git repositories, archived the way codeload does, and served to `fetch` locally. All seven passed the repository checks; 2,030 files were kept. aws-lc's `third_party/` (721 files) was dropped as vendored. Perl-generated assembly, lock files and generated headers were dropped as generated. Every SPDX header in ring and aws-lc is permissive (`Apache-2.0 OR ISC OR MIT-0` and the like), so none were dropped for `file_license`. 200 sampled `blob_id`s equal git's object ids. This run led to two fixes: directories named `generated*` count as generated, and whitespace no longer counts against `low_alnum` (it had dropped a 9-line tokio macro file).
+- **GraphQL.** The queries discover sends (search, owner, lookups by name) are valid against GitHub's published schema (`@octokit/graphql-schema` 15.26.1): fields, enum arguments and variable types. They have not run against the live API, which was blocked where this was built. On a first real run, use a small `--max-points` and check the frontier with `status`.
+- **Tests.** `cargo test` runs discover → plan → fetch → status against a fake GitHub. It covers search expansion and splitting, pagination, missing names and owners, a 503 retried after `retry-after`, a 404, commit and license-text mismatches, per-file drops, kept archives, reruns that make no requests, and a worker that stops after errors in a row and resumes. Unit tests cover every file check and SPDX expressions.
 
 ### Use
 
@@ -92,7 +133,7 @@ export GITHUB_TOKEN=...      # any token: reading public data needs no scopes
 cp github-seeds.example.yaml github-seeds.yaml    # searches, owners, repos, accept policy
 github-crawl discover --seeds github-seeds.yaml   # frontier in data/github.sqlite
 github-crawl plan --store s3://bucket/github      # prints the batch name
-github-crawl fetch --store s3://bucket/github --batch 20261007-215300 --rank 0 --world 4
+github-crawl fetch --store s3://bucket/github --batch 20261008-120000 --rank 0 --world 4
 github-crawl status --store s3://bucket/github
 ```
 

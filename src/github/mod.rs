@@ -1,9 +1,10 @@
-//! The GitHub crawler: public repositories under permissive licenses, kept as one source snapshot
-//! per repository, a tarball of the default branch at the commit discover saw.
+//! The GitHub crawler: source files from public repositories under permissive licenses, as
+//! file-level text records, read from a snapshot of each repository's default branch.
 
 pub mod api;
 pub mod config;
 pub mod discover;
+pub mod extract;
 pub mod fetch;
 pub mod frontier;
 pub mod license;
@@ -67,18 +68,14 @@ impl RepoMeta {
         })
     }
 
-    /// repos/<id % 100>/<id>/<sha>: keyed by id so renames don't matter, and by commit so a later
-    /// crawl of the same repository adds a snapshot instead of replacing one.
-    fn stem(&self) -> String {
-        format!("repos/{:02}/{}/{}", self.id % 100, self.id, self.sha)
-    }
-
+    /// Where `fetch --keep-archives` stores the tarball: keyed by id, which survives renames,
+    /// and by commit, so a later crawl of the same repository adds a snapshot.
     pub fn archive_path(&self) -> String {
-        format!("{}.tar.gz", self.stem())
-    }
-
-    /// The fetch record, written last: the repository is done once this exists.
-    pub fn record_path(&self) -> String {
-        format!("{}.json", self.stem())
+        format!(
+            "archives/{:02}/{}/{}.tar.gz",
+            self.id % 100,
+            self.id,
+            self.sha
+        )
     }
 }

@@ -7,12 +7,15 @@ use chrono::NaiveDate;
 use serde::Deserialize;
 
 use super::api::Repo;
+use super::license::PERMISSIVE;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// GitHub search queries, such as "license:mit language:rust stars:>=50". A search that matches
-    /// more than the 1,000 results GitHub returns is split by creation date until each part fits.
+    /// GitHub search queries, such as "language:rust stars:>=50". A query without `license:` runs
+    /// once per accepted license, so GitHub returns only repositories discover would accept. A
+    /// search that matches more than the 1,000 results GitHub returns is split by creation date
+    /// until each part fits.
     #[serde(default)]
     pub searches: Vec<String>,
     /// Users and organizations whose public repositories to check.
@@ -38,7 +41,8 @@ pub struct Accept {
     /// SPDX ids as GitHub reports them, compared ignoring case.
     pub licenses: Vec<String>,
     pub min_stars: i64,
-    /// Upper bound on GitHub's disk usage for the repository, history included.
+    /// Upper bound on GitHub's disk usage for the repository. It includes history, so it is a
+    /// loose bound on the snapshot: fetch caps the download itself.
     pub max_size_mb: i64,
     pub forks: bool,
     pub mirrors: bool,
@@ -47,27 +51,12 @@ pub struct Accept {
     pub pushed_after: Option<NaiveDate>,
 }
 
-/// Permissive licenses: use, change and redistribution allowed, with at most an attribution notice.
-pub const PERMISSIVE: &[&str] = &[
-    "MIT",
-    "MIT-0",
-    "Apache-2.0",
-    "BSD-2-Clause",
-    "BSD-3-Clause",
-    "ISC",
-    "0BSD",
-    "Unlicense",
-    "CC0-1.0",
-    "Zlib",
-    "BSL-1.0",
-];
-
 impl Default for Accept {
     fn default() -> Self {
         Self {
             licenses: PERMISSIVE.iter().map(|s| s.to_string()).collect(),
             min_stars: 0,
-            max_size_mb: 1024,
+            max_size_mb: 10 * 1024,
             forks: false,
             mirrors: false,
             archived: true,
@@ -136,6 +125,22 @@ impl Config {
             }
         }
         Ok(cfg)
+    }
+
+    /// The searches to run: each query as written if it sets `license:`, else one per accepted
+    /// license (GitHub's license keywords are the SPDX ids in lower case).
+    pub fn expanded_searches(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for q in &self.searches {
+            let q = q.trim();
+            if q.contains("license:") {
+                out.push(q.to_owned());
+            } else {
+                let licenses = self.accept.licenses.iter();
+                out.extend(licenses.map(|l| format!("{q} license:{}", l.to_ascii_lowercase())));
+            }
+        }
+        out
     }
 
     /// Every repository named in `repos` and `repo_files`, as owner/name.
@@ -221,7 +226,7 @@ mod tests {
         assert_eq!(accept.check(&r), Err("license:none".into()));
 
         let mut r = repo();
-        r.disk_usage = Some(2 * 1024 * 1024);
+        r.disk_usage = Some(20 * 1024 * 1024);
         assert_eq!(accept.check(&r), Err("too_large".into()));
 
         let strict = Accept {
@@ -280,6 +285,23 @@ mod tests {
         assert!(
             Config::load(&seeds).is_err(),
             "typos in the seeds file are errors"
+        );
+    }
+
+    #[test]
+    fn expands_searches_per_license() {
+        let mut cfg = Config {
+            searches: vec!["stars:>=10".into(), "license:mit topic:cli".into()],
+            ..Config::default()
+        };
+        cfg.accept.licenses = vec!["MIT".into(), "Apache-2.0".into()];
+        assert_eq!(
+            cfg.expanded_searches(),
+            vec![
+                "stars:>=10 license:mit",
+                "stars:>=10 license:apache-2.0",
+                "license:mit topic:cli"
+            ]
         );
     }
 

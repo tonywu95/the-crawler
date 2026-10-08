@@ -1,31 +1,40 @@
-//! fetch: a worker downloads the snapshots in its shards of a batch, from codeload.github.com.
+//! fetch: a worker turns the repositories in its shards of a batch into file-level text records.
 //!
-//! Codeload serves `git archive` of any commit as a tarball, outside the API and its rate limits,
-//! so workers need no token. Per repository the worker:
+//! Per repository, the worker downloads codeload.github.com/<owner>/<name>/tar.gz/<sha>, the
+//! `git archive` of that commit, to a temporary file. Codeload is outside the API and its rate
+//! limits, so workers need no token. Then it reads the tarball once:
 //!
-//! 1. downloads codeload.github.com/<owner>/<name>/tar.gz/<sha> to a temporary file;
-//! 2. checks the commit id `git archive` wrote into the tarball's pax header against <sha>, and
-//!    finds a top-level license file whose text matches the license GitHub reported;
-//! 3. stores the tarball, then the record. The record is written last: once it exists, the
-//!    repository is done, and reruns skip it.
+//! - the commit id `git archive` wrote into the pax header must be <sha>;
+//! - a top-level license file must match the license GitHub reported (see license.rs);
+//! - every other file goes through the checks in extract.rs, and the ones kept are staged.
 //!
-//! A shard's manifest is written when every repository in it is fetched or has failed for good.
+//! Only when both repository checks pass are its staged files added to the shard's output, so a
+//! rejected repository leaves nothing behind. When every repository in the shard is done:
+//!
+//! ```text
+//! files/<batch>/shard-00000.jsonl.gz     one kept file per line, with its repository's metadata
+//! manifests/<batch>/shard-00000.jsonl    written last, one line per repository: the shard is done
+//! ```
+//!
+//! A rerun skips shards that have a manifest, and redoes any other from its start.
 
-use std::io::{BufReader, Read};
+use std::collections::{BTreeMap, HashSet};
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
 
-use super::RepoMeta;
 use super::api::retry_after;
-use super::license;
+use super::{RepoMeta, extract, license};
 use crate::shards;
 use crate::store::Store;
 
@@ -44,57 +53,78 @@ pub struct FetchArgs {
     pub max_archive_bytes: u64,
     /// Stop the job after this many failed requests in a row.
     pub max_errors: u32,
+    /// Also store each tarball, under archives/.
+    pub keep_archives: bool,
 }
 
 /// Downloads of one repository before it is marked failed.
 const ATTEMPTS: u32 = 3;
-/// The most of a license file that is read (and kept in the record).
+/// The most of a license file that is read (and kept in the manifest).
 const MAX_LICENSE_BYTES: u64 = 256 * 1024;
 
-/// What a worker keeps about a fetched repository, next to its tarball.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Record {
-    pub repo: RepoMeta,
-    /// Store path of the tarball.
-    pub archive: String,
-    pub archive_bytes: u64,
-    pub archive_sha256: String,
-    pub files: u64,
-    pub uncompressed_bytes: u64,
-    /// The top-level license file that confirmed `repo.license`, and its text, for attribution.
-    pub license_file: String,
-    pub license_text: String,
-    pub fetched_at: String,
+pub fn files_path(batch: &str, k: usize) -> String {
+    format!("files/{batch}/shard-{k:05}.jsonl.gz")
 }
 
+/// One line of files/<batch>/shard-NNNNN.jsonl.gz: a source file and where it came from.
 #[derive(Serialize)]
-struct ManifestLine {
-    id: i64,
-    full_name: String,
-    sha: String,
-    status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<String>,
-    bytes: u64,
+struct FileLine<'a> {
+    repo: &'a str,
+    repo_id: i64,
+    commit: &'a str,
+    license: &'a str,
+    stars: i64,
+    path: &'a str,
+    language: &'static str,
+    size: u64,
+    /// The git blob id (sha1), for finding exact duplicates across repositories and crawls.
+    blob_id: String,
+    text: &'a str,
 }
 
-impl ManifestLine {
-    fn new(meta: &RepoMeta, status: &'static str, reason: Option<String>, bytes: u64) -> Self {
+/// One line of manifests/<batch>/shard-NNNNN.jsonl: a repository and what became of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoRecord {
+    #[serde(flatten)]
+    pub repo: RepoMeta,
+    /// "fetched" or "failed".
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Files kept, and their bytes of text.
+    pub files: u64,
+    pub bytes: u64,
+    /// Files not kept, by the reason (see extract.rs).
+    pub dropped: BTreeMap<String, u64>,
+    pub archive_bytes: u64,
+    /// The top-level license file that confirmed `license`, and its text, for attribution.
+    pub license_file: Option<String>,
+    pub license_text: Option<String>,
+    /// The crawler and version, which decide what was kept.
+    pub crawler: String,
+}
+
+impl RepoRecord {
+    fn failed(meta: &RepoMeta, reason: String, archive_bytes: u64) -> Self {
         Self {
-            id: meta.id,
-            full_name: meta.full_name.clone(),
-            sha: meta.sha.clone(),
-            status,
-            reason,
-            bytes,
+            repo: meta.clone(),
+            status: "failed".into(),
+            reason: Some(reason),
+            files: 0,
+            bytes: 0,
+            dropped: BTreeMap::new(),
+            archive_bytes,
+            license_file: None,
+            license_text: None,
+            crawler: crate::USER_AGENT.into(),
         }
     }
 }
 
 enum Outcome {
-    Fetched(Box<Record>),
+    Fetched(Box<RepoRecord>),
     /// Failed for good: retrying would get the same answer.
-    Failed(String),
+    Failed(Box<RepoRecord>),
     /// Worth retrying, after the wait the server asked for if it did.
     Transient(String, Option<Duration>),
 }
@@ -104,6 +134,7 @@ struct Totals {
     shards: usize,
     fetched: usize,
     failed: usize,
+    files: u64,
     bytes: u64,
 }
 
@@ -154,6 +185,7 @@ pub async fn run(args: FetchArgs) -> Result<()> {
                 total.shards += t.shards;
                 total.fetched += t.fetched;
                 total.failed += t.failed;
+                total.files += t.files;
                 total.bytes += t.bytes;
             }
             (job, Err(e)) => {
@@ -163,11 +195,12 @@ pub async fn run(args: FetchArgs) -> Result<()> {
         }
     }
     log!(
-        "finished {} shards: {} repositories fetched ({:.2} GB), {} failed",
+        "finished {} shards: {} repositories fetched, {} failed; {} files kept ({:.2} GB of text)",
         total.shards,
         total.fetched,
-        total.bytes as f64 / 1e9,
-        total.failed
+        total.failed,
+        total.files,
+        total.bytes as f64 / 1e9
     );
     if stopped > 0 {
         bail!("{stopped} of {jobs} jobs stopped early; rerun the same command to resume");
@@ -190,19 +223,29 @@ impl Worker {
                 .get(&shards::shard_path(&a.batch, k))
                 .await?
                 .with_context(|| format!("batch {} has no shard {k}", a.batch))?;
+            let out = Arc::new(Mutex::new(ShardOut::new()?));
             let mut lines = String::new();
             for line in shard.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
                 let meta: RepoMeta =
                     serde_json::from_slice(line).with_context(|| format!("parsing shard {k}"))?;
-                let done = self.repo(&meta, &mut streak).await?;
-                match done.status {
+                let record = self.repo(&meta, &out, &mut streak).await?;
+                match record.status.as_str() {
                     "fetched" => totals.fetched += 1,
                     _ => totals.failed += 1,
                 }
-                totals.bytes += done.bytes;
-                lines.push_str(&serde_json::to_string(&done)?);
+                totals.files += record.files;
+                totals.bytes += record.bytes;
+                lines.push_str(&serde_json::to_string(&record)?);
                 lines.push('\n');
             }
+            let out = Arc::into_inner(out)
+                .expect("the shard's output has one owner")
+                .into_inner()
+                .unwrap();
+            let gz = tokio::task::spawn_blocking(move || out.finish()).await??;
+            self.store
+                .put_file(&files_path(&a.batch, k), gz.path())
+                .await?;
             self.store.put(&manifest, lines).await?;
             totals.shards += 1;
             log!("job {job}: shard {k} done");
@@ -210,36 +253,37 @@ impl Worker {
         Ok(totals)
     }
 
-    /// Fetches one repository, unless its record shows that was done already. Errs, stopping the
-    /// job, after `max_errors` failed requests in a row.
-    async fn repo(&self, meta: &RepoMeta, streak: &mut u32) -> Result<ManifestLine> {
-        if let Some(bytes) = self.store.get(&meta.record_path()).await? {
-            let record: Record = serde_json::from_slice(&bytes).context("parsing a record")?;
-            return Ok(ManifestLine::new(
-                meta,
-                "fetched",
-                None,
-                record.archive_bytes,
-            ));
-        }
+    /// Fetches one repository into the shard's output. Errs, stopping the job, after
+    /// `max_errors` failed requests in a row.
+    async fn repo(
+        &self,
+        meta: &RepoMeta,
+        out: &Arc<Mutex<ShardOut>>,
+        streak: &mut u32,
+    ) -> Result<RepoRecord> {
         let mut attempt = 0;
-        let line = loop {
+        let record = loop {
             attempt += 1;
-            match self.fetch(meta).await? {
+            match self.fetch(meta, out).await? {
                 Outcome::Fetched(record) => {
                     *streak = 0;
+                    let dropped: u64 = record.dropped.values().sum();
                     log!(
-                        "{}: {} bytes, {} files",
+                        "{}: kept {} files ({} bytes), dropped {dropped}",
                         meta.full_name,
-                        record.archive_bytes,
-                        record.files
+                        record.files,
+                        record.bytes
                     );
-                    break ManifestLine::new(meta, "fetched", None, record.archive_bytes);
+                    break *record;
                 }
-                Outcome::Failed(reason) => {
+                Outcome::Failed(record) => {
                     *streak = 0;
-                    log!("{}: {reason}", meta.full_name);
-                    break ManifestLine::new(meta, "failed", Some(reason), 0);
+                    log!(
+                        "{}: {}",
+                        meta.full_name,
+                        record.reason.as_deref().unwrap_or("failed")
+                    );
+                    break *record;
                 }
                 Outcome::Transient(reason, asked) => {
                     *streak += 1;
@@ -253,23 +297,21 @@ impl Worker {
                     log!("{}: {reason}; waiting {}s", meta.full_name, wait.as_secs());
                     tokio::time::sleep(wait).await;
                     if attempt >= ATTEMPTS {
-                        break ManifestLine::new(
-                            meta,
-                            "failed",
-                            Some(format!("gave_up:{reason}")),
-                            0,
-                        );
+                        break RepoRecord::failed(meta, format!("gave_up:{reason}"), 0);
                     }
                 }
             }
         };
         let pause = rand::random_range(self.args.pause_min..=self.args.pause_max);
         tokio::time::sleep(pause).await;
-        Ok(line)
+        Ok(record)
     }
 
     /// One attempt at a repository. Errs only on local or store failures.
-    async fn fetch(&self, meta: &RepoMeta) -> Result<Outcome> {
+    async fn fetch(&self, meta: &RepoMeta, out: &Arc<Mutex<ShardOut>>) -> Result<Outcome> {
+        let failed = |reason: &str, bytes| {
+            Outcome::Failed(Box::new(RepoRecord::failed(meta, reason.into(), bytes)))
+        };
         let url = format!(
             "{}/{}/tar.gz/{}",
             self.args.codeload_url.trim_end_matches('/'),
@@ -284,19 +326,18 @@ impl Worker {
         if !status.is_success() {
             let reason = format!("HTTP {}", status.as_u16());
             return Ok(match status {
-                StatusCode::NOT_FOUND | StatusCode::GONE => Outcome::Failed("not_found".into()),
-                StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS => Outcome::Failed("blocked".into()),
+                StatusCode::NOT_FOUND | StatusCode::GONE => failed("not_found", 0),
+                StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS => failed("blocked", 0),
                 StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS => {
                     Outcome::Transient(reason, retry_after(resp.headers()))
                 }
                 s if s.is_server_error() => Outcome::Transient(reason, retry_after(resp.headers())),
-                _ => Outcome::Failed(reason),
+                _ => failed(&format!("http_{}", status.as_u16()), 0),
             });
         }
 
-        let tmp = tempfile::NamedTempFile::new().context("creating a temporary file")?;
-        let mut out = tokio::fs::File::from_std(tmp.reopen()?);
-        let mut hasher = Sha256::new();
+        let tmp = NamedTempFile::new().context("creating a temporary file")?;
+        let mut file = tokio::fs::File::from_std(tmp.reopen()?);
         let mut size = 0u64;
         let started = Instant::now();
         loop {
@@ -307,51 +348,49 @@ impl Worker {
             };
             size += chunk.len() as u64;
             if size > self.args.max_archive_bytes {
-                return Ok(Outcome::Failed("too_large".into()));
+                return Ok(failed("too_large", size));
             }
-            hasher.update(&chunk);
-            out.write_all(&chunk).await?;
+            file.write_all(&chunk).await?;
             if let Some(rate) = self.args.max_rate {
                 let due = Duration::from_secs_f64(size as f64 / rate);
                 tokio::time::sleep(due.saturating_sub(started.elapsed())).await;
             }
         }
-        out.flush().await?;
-        drop(out);
+        file.flush().await?;
+        drop(file);
 
-        let path = tmp.path().to_owned();
-        let snapshot = match tokio::task::spawn_blocking(move || inspect(&path)).await? {
-            Ok(snapshot) => snapshot,
-            Err(e) => return Ok(Outcome::Transient(format!("unreadable tarball: {e}"), None)),
+        let (path, repo, out) = (tmp.path().to_owned(), meta.clone(), out.clone());
+        let processed =
+            tokio::task::spawn_blocking(move || process(&path, &repo, &mut out.lock().unwrap()))
+                .await??;
+        let kept = match processed {
+            Processed::Kept(kept) => kept,
+            Processed::Rejected(reason) => return Ok(failed(&reason, size)),
+            Processed::Unreadable(e) => {
+                return Ok(Outcome::Transient(format!("unreadable tarball: {e}"), None));
+            }
         };
-        if snapshot.commit.as_deref() != Some(meta.sha.as_str()) {
-            let got = snapshot.commit.as_deref().unwrap_or("none");
-            return Ok(Outcome::Failed(format!("commit_mismatch:{got}")));
+        if self.args.keep_archives {
+            self.store
+                .put_file(&meta.archive_path(), tmp.path())
+                .await?;
         }
-        let (license_file, license_text) = match license::verify(&meta.license, &snapshot.licenses)
-        {
-            Ok(file) => file.clone(),
-            Err(why) => return Ok(Outcome::Failed(format!("license_check:{why}"))),
-        };
-
-        self.store
-            .put_file(&meta.archive_path(), tmp.path())
-            .await?;
-        let record = Record {
+        Ok(Outcome::Fetched(Box::new(RepoRecord {
             repo: meta.clone(),
-            archive: meta.archive_path(),
+            status: "fetched".into(),
+            reason: None,
+            files: kept.files,
+            bytes: kept.bytes,
+            dropped: kept
+                .dropped
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect(),
             archive_bytes: size,
-            archive_sha256: hex::encode(hasher.finalize()),
-            files: snapshot.files,
-            uncompressed_bytes: snapshot.bytes,
-            license_file,
-            license_text,
-            fetched_at: chrono::Utc::now().to_rfc3339(),
-        };
-        self.store
-            .put(&meta.record_path(), serde_json::to_vec_pretty(&record)?)
-            .await?;
-        Ok(Outcome::Fetched(Box::new(record)))
+            license_file: Some(kept.license_file),
+            license_text: Some(kept.license_text),
+            crawler: crate::USER_AGENT.into(),
+        })))
     }
 }
 
@@ -360,21 +399,112 @@ fn backoff(streak: u32) -> Duration {
     Duration::from_secs((30u64 << (streak.saturating_sub(1)).min(5)).min(900))
 }
 
-/// What a worker reads from a tarball before keeping it.
-#[derive(Debug, Default)]
-struct Snapshot {
-    /// The commit `git archive` recorded in the pax global header.
-    commit: Option<String>,
-    files: u64,
-    bytes: u64,
-    /// Top-level license files: (name, text).
-    licenses: Vec<(String, String)>,
+/// A shard's file records, gzipped into a temporary file as repositories finish.
+struct ShardOut {
+    tmp: NamedTempFile,
+    gz: GzEncoder<BufWriter<File>>,
+    /// Blob ids of the files already in the shard: an exact duplicate is not kept twice.
+    seen: HashSet<[u8; 20]>,
 }
 
-fn inspect(path: &Path) -> std::io::Result<Snapshot> {
-    let file = std::fs::File::open(path)?;
-    let mut archive = tar::Archive::new(GzDecoder::new(BufReader::new(file)));
-    let mut snap = Snapshot::default();
+impl ShardOut {
+    fn new() -> io::Result<Self> {
+        let tmp = NamedTempFile::new()?;
+        let gz = GzEncoder::new(
+            BufWriter::new(tmp.reopen()?),
+            flate2::Compression::default(),
+        );
+        Ok(Self {
+            tmp,
+            gz,
+            seen: HashSet::new(),
+        })
+    }
+
+    fn append(&mut self, staged: &mut Staged) -> io::Result<()> {
+        io::copy(&mut File::open(staged.tmp.path())?, &mut self.gz)?;
+        self.seen.extend(staged.new_ids.drain());
+        Ok(())
+    }
+
+    fn finish(self) -> io::Result<NamedTempFile> {
+        let Self { tmp, gz, .. } = self;
+        gz.finish()?
+            .into_inner()
+            .map_err(|e| e.into_error())?
+            .sync_all()?;
+        Ok(tmp)
+    }
+}
+
+/// What reading one repository's tarball came to.
+enum Processed {
+    Kept(Kept),
+    /// A repository check failed: the reason.
+    Rejected(String),
+    /// The tarball could not be read, probably a broken download.
+    Unreadable(String),
+}
+
+struct Kept {
+    files: u64,
+    bytes: u64,
+    dropped: BTreeMap<&'static str, u64>,
+    license_file: String,
+    license_text: String,
+}
+
+/// Reads the tarball, checks the commit and the license, and if both pass adds the repository's
+/// kept files to `out`. Errs only if writing to `out` fails.
+fn process(tarball: &Path, meta: &RepoMeta, out: &mut ShardOut) -> io::Result<Processed> {
+    let mut staged = match stage(tarball, meta, &out.seen) {
+        Ok(staged) => staged,
+        Err(e) => return Ok(Processed::Unreadable(e.to_string())),
+    };
+    if staged.commit.as_deref() != Some(meta.sha.as_str()) {
+        let got = staged.commit.as_deref().unwrap_or("none");
+        return Ok(Processed::Rejected(format!("commit_mismatch:{got}")));
+    }
+    let (license_file, license_text) = match license::verify(&meta.license, &staged.licenses) {
+        Ok(file) => file.clone(),
+        Err(why) => return Ok(Processed::Rejected(format!("license_check:{why}"))),
+    };
+    out.append(&mut staged)?;
+    Ok(Processed::Kept(Kept {
+        files: staged.files,
+        bytes: staged.bytes,
+        dropped: staged.dropped,
+        license_file,
+        license_text,
+    }))
+}
+
+/// One repository's kept files, staged (uncompressed) until its checks pass.
+struct Staged {
+    /// The commit `git archive` recorded in the pax global header.
+    commit: Option<String>,
+    /// Top-level license files: (name, text).
+    licenses: Vec<(String, String)>,
+    tmp: NamedTempFile,
+    new_ids: HashSet<[u8; 20]>,
+    files: u64,
+    bytes: u64,
+    dropped: BTreeMap<&'static str, u64>,
+}
+
+fn stage(tarball: &Path, meta: &RepoMeta, seen: &HashSet<[u8; 20]>) -> io::Result<Staged> {
+    let mut archive = tar::Archive::new(GzDecoder::new(BufReader::new(File::open(tarball)?)));
+    let tmp = NamedTempFile::new()?;
+    let mut writer = BufWriter::new(tmp.reopen()?);
+    let mut s = Staged {
+        commit: None,
+        licenses: Vec::new(),
+        tmp,
+        new_ids: HashSet::new(),
+        files: 0,
+        bytes: 0,
+        dropped: BTreeMap::new(),
+    };
     for entry in archive.entries()? {
         let mut entry = entry?;
         let kind = entry.header().entry_type();
@@ -383,7 +513,7 @@ fn inspect(path: &Path) -> std::io::Result<Snapshot> {
                 for ext in extensions {
                     let ext = ext?;
                     if ext.key() == Ok("comment") {
-                        snap.commit = ext.value().ok().map(str::to_owned);
+                        s.commit = ext.value().ok().map(str::to_owned);
                     }
                 }
             }
@@ -392,25 +522,72 @@ fn inspect(path: &Path) -> std::io::Result<Snapshot> {
         if !kind.is_file() {
             continue;
         }
-        snap.files += 1;
-        snap.bytes += entry.size();
-        // Entries are <repo>-<sha>/<path>; license files sit right under that top directory.
-        let path = entry.path()?.into_owned();
-        let mut parts = path.components();
-        let (Some(_), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
-            continue;
-        };
-        let name = name.as_os_str().to_string_lossy().into_owned();
-        if license::is_license_file(&name) {
+        // Entries are <repo>-<sha>/<path>.
+        let full = entry.path()?.into_owned();
+        let parts: Vec<String> = full
+            .components()
+            .skip(1)
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        let path = parts.join("/");
+        if parts.len() == 1 && license::is_license_file(&path) {
             let mut text = Vec::new();
             (&mut entry)
                 .take(MAX_LICENSE_BYTES)
                 .read_to_end(&mut text)?;
-            snap.licenses
-                .push((name, String::from_utf8_lossy(&text).into_owned()));
+            s.licenses
+                .push((path, String::from_utf8_lossy(&text).into_owned()));
+            tally(&mut s.dropped, "license_file");
+            continue;
         }
+        let (language, kind) = match extract::check_path(&path) {
+            Ok(found) => found,
+            Err(reason) => {
+                tally(&mut s.dropped, reason);
+                continue;
+            }
+        };
+        if let Err(reason) = extract::check_size(entry.size(), kind) {
+            tally(&mut s.dropped, reason);
+            continue;
+        }
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut bytes)?;
+        let text = match extract::check_content(&bytes, kind, &meta.license) {
+            Ok(text) => text,
+            Err(reason) => {
+                tally(&mut s.dropped, reason);
+                continue;
+            }
+        };
+        let id = extract::blob_id(&bytes);
+        if seen.contains(&id) || !s.new_ids.insert(id) {
+            tally(&mut s.dropped, "duplicate");
+            continue;
+        }
+        let line = FileLine {
+            repo: &meta.full_name,
+            repo_id: meta.id,
+            commit: &meta.sha,
+            license: &meta.license,
+            stars: meta.stars,
+            path: &path,
+            language,
+            size: bytes.len() as u64,
+            blob_id: hex::encode(id),
+            text,
+        };
+        serde_json::to_writer(&mut writer, &line)?;
+        writer.write_all(b"\n")?;
+        s.files += 1;
+        s.bytes += bytes.len() as u64;
     }
-    Ok(snap)
+    writer.flush()?;
+    Ok(s)
+}
+
+fn tally(dropped: &mut BTreeMap<&'static str, u64>, reason: &'static str) {
+    *dropped.entry(reason).or_default() += 1;
 }
 
 #[cfg(test)]
@@ -419,10 +596,8 @@ pub(crate) mod tests {
 
     /// A tarball shaped like codeload's: a pax global header with the commit, then <name>-<sha>/...
     pub(crate) fn tarball(name: &str, sha: &str, files: &[(&str, &str)]) -> Vec<u8> {
-        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
-            Vec::new(),
-            flate2::Compression::fast(),
-        ));
+        let mut builder =
+            tar::Builder::new(GzEncoder::new(Vec::new(), flate2::Compression::fast()));
         let record = format!("comment={sha}\n");
         // A pax record is "<length> <key>=<value>\n", the length counting its own digits.
         let mut len = record.len();
@@ -449,26 +624,119 @@ pub(crate) mod tests {
         builder.into_inner().unwrap().finish().unwrap()
     }
 
+    fn meta(sha: &str) -> RepoMeta {
+        RepoMeta {
+            id: 7,
+            full_name: "octo/cat".into(),
+            url: "https://github.com/octo/cat".into(),
+            branch: "main".into(),
+            sha: sha.into(),
+            license: "MIT".into(),
+            stars: 3,
+            forks: 0,
+            size_kb: 1,
+            language: None,
+            topics: vec![],
+            description: None,
+            archived: false,
+            created_at: "2020-01-01T00:00:00Z".into(),
+            pushed_at: None,
+        }
+    }
+
     #[test]
-    fn reads_commit_and_license_files() {
+    fn stages_kept_files_and_counts_the_rest() {
         let sha = "0123456789abcdef0123456789abcdef01234567";
         let tgz = tarball(
             "cat",
             sha,
             &[
                 ("LICENSE", "MIT License"),
-                ("src/LICENSE", "not top level"),
-                ("src/main.rs", "fn main() {}"),
+                ("src/main.rs", "fn main() {}\n"),
+                ("src/copy.rs", "fn main() {}\n"),
+                ("src/LICENSE", "not top level, and no language"),
+                ("vendor/dep/lib.rs", "pub fn dep() {}\n"),
+                ("logo.png", "\u{89}PNG"),
             ],
         );
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &tgz).unwrap();
-        let snap = inspect(tmp.path()).unwrap();
-        assert_eq!(snap.commit.as_deref(), Some(sha));
-        assert_eq!(snap.files, 3);
+        let staged = stage(tmp.path(), &meta(sha), &HashSet::new()).unwrap();
+        assert_eq!(staged.commit.as_deref(), Some(sha));
         assert_eq!(
-            snap.licenses,
+            staged.licenses,
             vec![("LICENSE".to_string(), "MIT License".to_string())]
+        );
+        assert_eq!((staged.files, staged.bytes), (1, 13));
+        let dropped: Vec<_> = staged.dropped.iter().map(|(k, v)| (*k, *v)).collect();
+        assert_eq!(
+            dropped,
+            vec![
+                ("duplicate", 1),
+                ("license_file", 1),
+                ("unknown_type", 2),
+                ("vendored", 1)
+            ]
+        );
+        let line: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(staged.tmp.path()).unwrap().trim())
+                .unwrap();
+        assert_eq!(line["path"], "src/main.rs");
+        assert_eq!(line["language"], "Rust");
+        assert_eq!(line["text"], "fn main() {}\n");
+        assert_eq!(
+            line["blob_id"],
+            hex::encode(extract::blob_id(b"fn main() {}\n"))
+        );
+    }
+
+    #[test]
+    fn rejects_repositories_whose_checks_fail() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let mut out = ShardOut::new().unwrap();
+        let check = |files: &[(&str, &str)], tar_sha: &str, out: &mut ShardOut| {
+            let tmp = NamedTempFile::new().unwrap();
+            std::fs::write(tmp.path(), tarball("cat", tar_sha, files)).unwrap();
+            match process(tmp.path(), &meta(sha), out).unwrap() {
+                Processed::Kept(k) => format!("kept {}", k.files),
+                Processed::Rejected(r) => r,
+                Processed::Unreadable(e) => format!("unreadable {e}"),
+            }
+        };
+        let mit = "Permission is hereby granted, free of charge, to any person obtaining a copy";
+        let code = ("a.py", "print('hi')\n");
+        assert_eq!(
+            check(&[code], sha, &mut out),
+            "license_check:no_license_file"
+        );
+        assert_eq!(
+            check(&[("LICENSE", "GPL"), code], sha, &mut out),
+            "license_check:text_mismatch"
+        );
+        assert_eq!(
+            check(&[("LICENSE", mit), code], &"f".repeat(40), &mut out),
+            format!("commit_mismatch:{}", "f".repeat(40))
+        );
+        assert_eq!(check(&[("LICENSE", mit), code], sha, &mut out), "kept 1");
+        // The same file again is a duplicate of what the shard already holds.
+        assert_eq!(check(&[("LICENSE", mit), code], sha, &mut out), "kept 0");
+
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"not a tarball").unwrap();
+        assert!(matches!(
+            process(tmp.path(), &meta(sha), &mut out).unwrap(),
+            Processed::Unreadable(_)
+        ));
+
+        let gz = out.finish().unwrap();
+        let mut text = String::new();
+        GzDecoder::new(File::open(gz.path()).unwrap())
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "rejected repositories add nothing: {text}"
         );
     }
 

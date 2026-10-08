@@ -55,7 +55,7 @@ pub async fn run(db: &Path, store: Option<&str>, api: Option<(&str, &str)>) -> R
         println!("batches in {location}");
         println!(
             "  {:<17} {:>13} {:>24} {:>18}",
-            "batch", "shards done", "repos fetched/failed", "GB stored (est)"
+            "batch", "shards done", "repos fetched/failed", "GB of text"
         );
         for b in shards::list_batches(&store).await? {
             let p = shards::progress(&store, &b.batch).await?;
@@ -65,11 +65,7 @@ pub async fn run(db: &Path, store: Option<&str>, api: Option<(&str, &str)>) -> R
                 b.batch,
                 format!("{}/{}", p.shards_done, b.shards),
                 format!("{}/{} of {}", count("fetched"), count("failed"), b.items),
-                format!(
-                    "{:.2} ({:.1})",
-                    p.bytes as f64 / 1e9,
-                    b.est_bytes as f64 / 1e9
-                ),
+                format!("{:.2}", p.bytes as f64 / 1e9),
             );
         }
     }

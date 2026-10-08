@@ -5,7 +5,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use the_crawler::github::{discover, fetch, plan, status};
 
-/// Crawls public GitHub repositories under permissive licenses: one source snapshot per repository.
+/// Crawls source files from public GitHub repositories under permissive licenses.
 #[derive(Parser)]
 #[command(name = "github-crawl", version)]
 struct Cli {
@@ -50,7 +50,7 @@ enum Command {
         #[arg(long)]
         max_repos: Option<usize>,
     },
-    /// Download the snapshots in this worker's shards of a batch. Rerun the same command to resume.
+    /// Turn this worker's shards of a batch into file-level text records. Rerun to resume.
     Fetch {
         #[arg(long)]
         store: String,
@@ -74,8 +74,11 @@ enum Command {
         #[arg(long, default_value_t = 10.0)]
         max_rate_mb: f64,
         /// Give up on tarballs larger than this.
-        #[arg(long, default_value_t = 1024)]
+        #[arg(long, default_value_t = 2048)]
         max_archive_mb: u64,
+        /// Also store each repository's tarball, under archives/.
+        #[arg(long)]
+        keep_archives: bool,
         /// Stop after this many failed requests in a row.
         #[arg(long, default_value_t = 6)]
         max_errors: u32,
@@ -148,6 +151,7 @@ async fn main() -> Result<()> {
             max_rate_mb,
             max_archive_mb,
             max_errors,
+            keep_archives,
             codeload_url,
         } => {
             fetch::run(fetch::FetchArgs {
@@ -162,6 +166,7 @@ async fn main() -> Result<()> {
                 max_rate: (max_rate_mb > 0.0).then_some(max_rate_mb * 1e6),
                 max_archive_bytes: max_archive_mb * 1024 * 1024,
                 max_errors,
+                keep_archives,
             })
             .await
         }

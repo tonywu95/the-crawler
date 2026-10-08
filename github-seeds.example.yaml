@@ -2,11 +2,12 @@
 # Seeds already in the frontier are skipped, so adding a line and rerunning only does the new work.
 
 # GitHub search queries (https://docs.github.com/search-github/searching-on-github/searching-for-repositories).
-# A search that matches more than the 1,000 results GitHub returns is split by creation date until
-# each part fits, unless the query sets created: itself.
+# A query without license: runs once per accepted license, so GitHub only returns repositories that
+# can be accepted. A search that matches more than the 1,000 results GitHub returns is split by
+# creation date until each part fits, unless the query sets created: itself.
 searches:
-  - "license:mit language:rust stars:>=50"
-  - "license:apache-2.0 language:python stars:>=100"
+  - "language:rust stars:>=50"
+  - "language:python stars:>=100 license:apache-2.0"
 
 # Users and organizations: all of their public repositories are checked.
 owners:
@@ -17,13 +18,14 @@ repos:
   - tokio-rs/tokio
 
 # Files of repositories, one per line, # for comments. Paths are relative to this file.
+# Lists from elsewhere (GH Archive, BigQuery) reach repositories search doesn't.
 repo_files: []
 
 # Which repositories are accepted. These are the defaults; any key can be left out.
 accept:
   licenses: [MIT, MIT-0, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, 0BSD, Unlicense, CC0-1.0, Zlib, BSL-1.0]
   min_stars: 0
-  max_size_mb: 1024    # GitHub's disk usage, history included
+  max_size_mb: 10240   # GitHub's disk usage, history included; fetch caps the download
   forks: false
   mirrors: false
   archived: true
